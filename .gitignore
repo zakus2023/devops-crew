@@ -1,0 +1,12 @@
+# crew-DevOps repo: common ignores
+.venv/
+.env
+!.env.example
+__pycache__/
+*.pyc
+.pytest_cache/
+*.log
+.DS_Store
+Thumbs.db
+# app/ (Node.js)
+app/node_modules/
