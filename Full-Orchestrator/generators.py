@@ -61,6 +61,8 @@ provider "aws" {{
   region = var.region
 }}
 
+data "aws_caller_identity" "current" {{}}
+
 resource "aws_kms_key" "tfstate" {{
   description             = "${{var.project}} terraform state key"
   deletion_window_in_days = 10
@@ -118,6 +120,33 @@ resource "aws_s3_bucket_public_access_block" "cloudtrail" {{
   block_public_policy     = true
   ignore_public_acls      = true
   restrict_public_buckets = true
+}}
+
+# CloudTrail requires this S3 bucket policy to write logs (GetBucketAcl + PutObject).
+resource "aws_s3_bucket_policy" "cloudtrail" {{
+  bucket = aws_s3_bucket.cloudtrail.id
+  policy = jsonencode({{
+    Version = "2012-10-17"
+    Statement = [
+      {{
+        Sid       = "AWSCloudTrailAclCheck"
+        Effect    = "Allow"
+        Principal = {{ Service = "cloudtrail.amazonaws.com" }}
+        Action    = "s3:GetBucketAcl"
+        Resource  = "arn:aws:s3:::${{aws_s3_bucket.cloudtrail.bucket}}"
+      }},
+      {{
+        Sid       = "AWSCloudTrailWrite"
+        Effect    = "Allow"
+        Principal = {{ Service = "cloudtrail.amazonaws.com" }}
+        Action    = "s3:PutObject"
+        Resource  = "arn:aws:s3:::${{aws_s3_bucket.cloudtrail.bucket}}/AWSLogs/${{data.aws_caller_identity.current.account_id}}/*"
+        Condition = {{
+          StringEquals = {{ "s3:x-amz-acl" = "bucket-owner-full-control" }}
+        }}
+      }}
+    ]
+  }})
 }}
 ''', output_dir)
     # outputs.tf: values needed by envs (backend bucket, lock table, KMS ARN, cloudtrail bucket).
@@ -183,6 +212,10 @@ variable "enable_securityhub" {{ type = bool }}
 variable "enable_inspector2" {{ type = bool }}
 variable "enable_config" {{ type = bool }}
 variable "enable_deployment_alarms" {{ type = bool }}
+variable "enable_bastion" {{ type = bool }}
+variable "key_name" {{ type = string }}
+variable "allowed_bastion_cidr" {{ type = string }}
+variable "enable_ecs" {{ type = bool }}
 ''', output_dir)
     # Fallback: minimal platform (SSM only). Add full .tf files in crew-DevOps/infra/modules/platform and re-run to copy.
     _write("infra/modules/platform/main.tf", f'''# Platform module for ${{var.project}}-${{var.env}}
@@ -235,6 +268,10 @@ def generate_dev_env(requirements: Dict[str, Any], output_dir: str) -> str:
     max_s = _get(dev, "max_size") or 2
     desired = _get(dev, "desired_capacity") or 1
     ami_id = _get(dev, "ami_id") or ""
+    enable_bastion_dev = _get(dev, "enable_bastion") or False
+    key_name_dev = _get(dev, "key_name") or ""
+    allowed_bastion_cidr_dev = _get(dev, "allowed_bastion_cidr") or "0.0.0.0/0"
+    enable_ecs_dev = _get(dev, "enable_ecs") or False
 
     _write("infra/envs/dev/main.tf", f'''terraform {{
   required_version = ">= 1.6.0"
@@ -271,6 +308,10 @@ module "platform" {{
   enable_inspector2 = var.enable_inspector2
   enable_config     = var.enable_config
   enable_deployment_alarms = var.enable_deployment_alarms
+  enable_bastion = var.enable_bastion
+  key_name = var.key_name
+  allowed_bastion_cidr = var.allowed_bastion_cidr
+  enable_ecs = var.enable_ecs
 }}
 ''', output_dir)
     # variables.tf: same shape as module inputs (project, region, domain, VPC, instance, etc.).
@@ -293,8 +334,20 @@ variable "enable_securityhub" { type = bool }
 variable "enable_inspector2" { type = bool }
 variable "enable_config" { type = bool }
 variable "enable_deployment_alarms" { type = bool }
+variable "enable_bastion" { type = bool }
+variable "key_name" { type = string }
+variable "allowed_bastion_cidr" { type = string }
+variable "enable_ecs" { type = bool }
 ''', output_dir)
-    _write("infra/envs/dev/outputs.tf", 'output "https_url" { value = module.platform.https_url }\n', output_dir)
+    _write("infra/envs/dev/outputs.tf", '''output "https_url" { value = module.platform.https_url }
+output "artifacts_bucket" { value = module.platform.artifacts_bucket }
+output "ecr_repo" { value = module.platform.ecr_repo }
+output "codedeploy_app" { value = module.platform.codedeploy_app }
+output "codedeploy_group" { value = module.platform.codedeploy_group }
+output "bastion_public_ip" { value = module.platform.bastion_public_ip }
+output "ecs_cluster_name" { value = module.platform.ecs_cluster_name }
+output "ecs_service_name" { value = module.platform.ecs_service_name }
+''', output_dir)
     # backend.hcl: user fills bucket/dynamodb_table from bootstrap outputs before init.
     _write("infra/envs/dev/backend.hcl", '''# Fill bucket, key, dynamodb_table after bootstrap apply
 bucket         = "YOUR_TFSTATE_BUCKET"
@@ -321,10 +374,14 @@ max_size         = {max_s}
 desired_capacity = {desired}
 ami_id = "{ami_id}"
 enable_deployment_alarms = false
-enable_guardduty = true
-enable_securityhub = true
+enable_guardduty = false
+enable_securityhub = false
 enable_inspector2 = true
-enable_config = true
+enable_config = false
+enable_bastion = {str(enable_bastion_dev).lower()}
+key_name = "{key_name_dev}"
+allowed_bastion_cidr = "{allowed_bastion_cidr_dev}"
+enable_ecs = {str(enable_ecs_dev).lower()}
 ''', output_dir)
     return f"Dev environment written to {output_dir}/infra/envs/dev"
 
@@ -345,6 +402,10 @@ def generate_prod_env(requirements: Dict[str, Any], output_dir: str) -> str:
     max_s = _get(prod, "max_size") or 6
     desired = _get(prod, "desired_capacity") or 2
     ami_id = _get(prod, "ami_id") or ""
+    enable_bastion_prod = _get(prod, "enable_bastion") or False
+    key_name_prod = _get(prod, "key_name") or ""
+    allowed_bastion_cidr_prod = _get(prod, "allowed_bastion_cidr") or "0.0.0.0/0"
+    enable_ecs_prod = _get(prod, "enable_ecs") or False
 
     # Same layout as dev: main.tf (backend + module), variables.tf, outputs.tf, backend.hcl, prod.tfvars.
     _write("infra/envs/prod/main.tf", f'''terraform {{
@@ -382,6 +443,10 @@ module "platform" {{
   enable_inspector2 = var.enable_inspector2
   enable_config     = var.enable_config
   enable_deployment_alarms = var.enable_deployment_alarms
+  enable_bastion = var.enable_bastion
+  key_name = var.key_name
+  allowed_bastion_cidr = var.allowed_bastion_cidr
+  enable_ecs = var.enable_ecs
 }}
 ''', output_dir)
     _write("infra/envs/prod/variables.tf", '''variable "project" { type = string }
@@ -403,8 +468,20 @@ variable "enable_securityhub" { type = bool }
 variable "enable_inspector2" { type = bool }
 variable "enable_config" { type = bool }
 variable "enable_deployment_alarms" { type = bool }
+variable "enable_bastion" { type = bool }
+variable "key_name" { type = string }
+variable "allowed_bastion_cidr" { type = string }
+variable "enable_ecs" { type = bool }
 ''', output_dir)
-    _write("infra/envs/prod/outputs.tf", 'output "https_url" { value = module.platform.https_url }\n', output_dir)
+    _write("infra/envs/prod/outputs.tf", '''output "https_url" { value = module.platform.https_url }
+output "artifacts_bucket" { value = module.platform.artifacts_bucket }
+output "ecr_repo" { value = module.platform.ecr_repo }
+output "codedeploy_app" { value = module.platform.codedeploy_app }
+output "codedeploy_group" { value = module.platform.codedeploy_group }
+output "bastion_public_ip" { value = module.platform.bastion_public_ip }
+output "ecs_cluster_name" { value = module.platform.ecs_cluster_name }
+output "ecs_service_name" { value = module.platform.ecs_service_name }
+''', output_dir)
     _write("infra/envs/prod/backend.hcl", '''bucket         = "YOUR_TFSTATE_BUCKET"
 key            = "prod/terraform.tfstate"
 region         = "us-east-1"
@@ -428,10 +505,14 @@ max_size         = {max_s}
 desired_capacity = {desired}
 ami_id = "{ami_id}"
 enable_deployment_alarms = true
-enable_guardduty = true
-enable_securityhub = true
+enable_guardduty = false
+enable_securityhub = false
 enable_inspector2 = true
-enable_config = true
+enable_config = false
+enable_bastion = {str(enable_bastion_prod).lower()}
+key_name = "{key_name_prod}"
+allowed_bastion_cidr = "{allowed_bastion_cidr_prod}"
+enable_ecs = {str(enable_ecs_prod).lower()}
 ''', output_dir)
     return f"Prod environment written to {output_dir}/infra/envs/prod"
 
@@ -726,7 +807,13 @@ def write_run_order(output_dir: str, run_order_text: str) -> str:
     """Write RUN_ORDER.md with the sequence of commands to run after generation. run_order_text is appended (e.g. agent summary)."""
     content = f"""# Run order (generated by Full-Orchestrator)
 
-Run these commands in order from the **generated project root** (`{output_dir}`).
+Run these commands in order from the **generated project root** (this directory, or `{output_dir}` when generated).
+
+**Who runs deploy?** Full-Orchestrator only **generates** this project; it does **not** run Terraform apply, build, or deploy. You can either:
+- **Manual:** Follow the steps below (build + deploy).
+- **Multi-Agent-Pipeline:** Point Multi-Agent-Pipeline (or Combined-Crew) at this output directory; it will run Infra → Build → Deploy → Verify for you.
+
+---
 
 ## 1. Bootstrap (once)
 
@@ -736,7 +823,16 @@ terraform init
 terraform apply -auto-approve
 ```
 
-Then copy outputs: `terraform output` → update `infra/envs/dev/backend.hcl` and `infra/envs/prod/backend.hcl` with bucket, dynamodb_table, and set cloudtrail_bucket in dev.tfvars and prod.tfvars.
+Copy bootstrap outputs into env config:
+
+```bash
+# From infra/bootstrap after apply:
+terraform output -raw tfstate_bucket      # → backend.hcl: bucket
+terraform output -raw tflock_table       # → backend.hcl: dynamodb_table
+terraform output -raw cloudtrail_bucket  # → dev.tfvars and prod.tfvars: cloudtrail_bucket
+```
+
+Update `infra/envs/dev/backend.hcl`, `infra/envs/prod/backend.hcl` (bucket, dynamodb_table), and `infra/envs/dev/dev.tfvars`, `infra/envs/prod/prod.tfvars` (cloudtrail_bucket).
 
 ## 2. Dev environment
 
@@ -754,19 +850,92 @@ terraform init -backend-config=backend.hcl -reconfigure
 terraform apply -auto-approve -var-file=prod.tfvars
 ```
 
-## 4. OIDC (GitHub Actions)
+## 4. OIDC (GitHub Actions, optional)
 
-Create IAM OIDC provider and role for your GitHub repo, then add secrets: AWS_ROLE_TO_ASSUME, AWS_REGION.
-
-## 5. Build and deploy
-
-**Build:** Push to main (app changes trigger build-push) or run Docker build + ECR push and update SSM image_tag.
-
-**Deploy (choose one):**
-- **CodeDeploy:** Upload deploy bundle (zip) to S3, then trigger deployment (e.g. `aws deploy create-deployment` or use trigger_codedeploy with application name, deployment group, s3_bucket, s3_key). Set `DEPLOY_METHOD=codedeploy` in CI if using this path.
-- **Ansible:** From repo root, run: `ansible-playbook -i ansible/inventory/ec2_prod.aws_ec2.yml ansible/playbooks/deploy.yml -e ssm_bucket=YOUR_ARTIFACTS_BUCKET -e env=prod`. Get `ssm_bucket` from `terraform output -raw artifacts_bucket` in infra/envs/prod. Set `DEPLOY_METHOD=ansible` in CI if using this path.
+Create IAM OIDC provider and role for your GitHub repo, then add secrets: AWS_ROLE_TO_ASSUME, AWS_REGION. Skip if you deploy only manually.
 
 ---
+
+## 5. Build (Docker → ECR → SSM)
+
+From the **project root** (this directory), after dev and prod are applied:
+
+```bash
+export AWS_REGION=us-east-1
+export ENV=prod
+# Get ECR repo name from Terraform (e.g. prod)
+ECR_REPO=$(cd infra/envs/$ENV && terraform output -raw ecr_repo)
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+ECR_URI=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO
+IMAGE_TAG=$(git rev-parse --short HEAD 2>/dev/null || echo "latest")
+
+# Build and push
+docker build -t $ECR_URI:$IMAGE_TAG ./app
+aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+docker push $ECR_URI:$IMAGE_TAG
+
+# Tell the platform which image to deploy (CodeDeploy/Ansible read this)
+aws ssm put-parameter --name "/bluegreen/$ENV/image_tag" --type String --value "$IMAGE_TAG" --overwrite --region $AWS_REGION
+```
+
+For **dev**, repeat with `ENV=dev` and the dev ECR repo.
+
+---
+
+## 6. Deploy (choose one)
+
+### Option A — CodeDeploy
+
+From project root:
+
+```bash
+export AWS_REGION=us-east-1
+export ENV=prod
+BUCKET=$(cd infra/envs/$ENV && terraform output -raw artifacts_bucket)
+APP=$(cd infra/envs/$ENV && terraform output -raw codedeploy_app)
+GROUP=$(cd infra/envs/$ENV && terraform output -raw codedeploy_group)
+
+# Create deploy bundle and upload
+(cd deploy && zip -r ../deploy.zip .)
+S3_KEY=deploy-$(date +%Y%m%d%H%M%S).zip
+aws s3 cp deploy.zip s3://$BUCKET/$S3_KEY
+
+# Trigger deployment
+aws deploy create-deployment \\
+  --application-name $APP \\
+  --deployment-group-name $GROUP \\
+  --s3-location bucket=$BUCKET,key=$S3_KEY,bundleType=zip \\
+  --region $AWS_REGION
+```
+
+### Option B — Ansible
+
+From project root:
+
+```bash
+# Install Ansible collections (once)
+ansible-galaxy collection install -r ansible/requirements.yml
+
+# Deploy to prod (SSM connection; EC2s must have SSM agent and correct IAM)
+export AWS_REGION=us-east-1
+SSM_BUCKET=$(cd infra/envs/prod && terraform output -raw artifacts_bucket)
+ansible-playbook -i ansible/inventory/ec2_prod.aws_ec2.yml ansible/playbooks/deploy.yml -e ssm_bucket=$SSM_BUCKET -e env=prod -e ssm_region=$AWS_REGION
+```
+
+For **dev**, use inventory `ansible/inventory/ec2_dev.aws_ec2.yml` and `env=dev`, and get `SSM_BUCKET` from `infra/envs/dev`.
+
+---
+
+## 7. Verify (optional)
+
+```bash
+# Health check (use your app URL from Terraform output)
+curl -sf https://dev-app.example.com/health
+# Or: cd infra/envs/prod && terraform output https_url
+```
+
+---
+
 {run_order_text}
 """
     _write("RUN_ORDER.md", content, output_dir)

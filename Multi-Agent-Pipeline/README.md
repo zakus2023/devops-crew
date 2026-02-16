@@ -1,26 +1,43 @@
 # Multi-Agent Deploy Pipeline
 
-Run a **four-step deployment flow** on the **CICD-With-AI** repo: **Terraform → Build → Deploy → Verify**, using four specialist CrewAI agents.
+Run a **four-step deployment flow** on your **deployment project**: **Terraform → Build → Deploy → Verify**, using four specialist CrewAI agents.
 
-This folder lives in **crew-DevOps** (next to CICD-With-AI and Full-Orchestrator). By default it uses **CICD-With-AI** as the repo root for Terraform; when **crew-DevOps/app** exists, the Build step uses that app for Docker build (set **APP_ROOT** to override).
+This folder lives in **crew-DevOps** (next to Full-Orchestrator). You point it at a **deployment project** via **REPO_ROOT** (e.g. **Full-Orchestrator/output**). When **crew-DevOps/app** exists, the Build step uses that app for Docker build (set **APP_ROOT** to override).
 
 - **EXPLANATION.md** — Beginner-level: what it is, why use it, how it works.
-- **IMPLEMENTATION.md** — Step-by-step: setup, commands, and more details.
+- **IMPLEMENTATION.md** — Step-by-step: setup, commands, deploy options (including ssh_script).
 
 ## Quick start
 
 ```bash
 cd Multi-Agent-Pipeline
 python -m venv .venv
-source .venv/Scripts/activate   # Bash
+source .venv/Scripts/activate   # Bash (Windows: .venv\Scripts\activate)
 pip install -r requirements.txt
-copy .env.example .env   # set PROD_URL and OPENAI_API_KEY
+copy .env.example .env   # Windows; use cp on Linux/macOS
+# Edit .env: PROD_URL, OPENAI_API_KEY, and optionally DEPLOY_METHOD, SSH_KEY_PATH
 python run.py
 ```
 
-Pipeline order: **Infra (Terraform)** → **Build (Docker + ECR + SSM)** → **Deploy (CodeDeploy or Ansible)** → **Verify (health + SSM)**.
+Pipeline order: **Infra (Terraform)** → **Build (Docker + ECR + SSM)** → **Deploy** → **Verify (health + SSM)**.
 
-Set `ALLOW_TERRAFORM_APPLY=1` to allow Terraform apply; set **DEPLOY_METHOD=codedeploy** or **DEPLOY_METHOD=ansible** to choose deploy method.
+Set `ALLOW_TERRAFORM_APPLY=1` to allow Terraform apply. Set **DEPLOY_METHOD** to choose how Deploy runs: **codedeploy**, **ansible**, **ssh_script**, or **ecs**.
+
+---
+
+## Quick path: ssh_script deploy (step-by-step)
+
+If you want to deploy via **SSH** (no Ansible, no CodeDeploy), follow these steps. The pipeline will SSH into each EC2 instance tagged `Env=prod`, pull the new image from ECR, and run the app container.
+
+| Step | Action |
+|------|--------|
+| 1 | In `.env` set `DEPLOY_METHOD=ssh_script`. |
+| 2 | Set `SSH_KEY_PATH` to the **full path** of your `.pem` file (e.g. `C:/My-Projects/crew-DevOps/my-key.pem`). This key must match the AWS key pair used by your EC2 instances (and bastion, if used). |
+| 3 | Ensure your app EC2 instances have the tag **Env=prod** (or **Env=dev**). The pipeline discovers instances by this tag. |
+| 4 | **If instances are in private subnets:** In Terraform (e.g. `infra/envs/prod/prod.tfvars`) set `enable_bastion = true` and `key_name = "YOUR_KEY_PAIR_NAME"`, then apply. In `.env` leave **BASTION_HOST** unset so the pipeline auto-reads the bastion IP from Terraform. |
+| 5 | Run `python run.py`. The Deploy step will connect (via bastion if configured), run ECR login and `sudo docker pull`, then start the new container on each instance. |
+
+**Troubleshooting:** Permission denied on the bastion → ensure your `.pem` matches the bastion’s key pair; test with `ssh -i /path/to/key.pem ec2-user@BASTION_IP "echo OK"`. Permission denied on Docker → the script uses `sudo docker`; ensure Docker is installed and `ec2-user` has sudo. See **IMPLEMENTATION.md** (§6.3, ssh_script step-by-step) for more.
 
 ---
 

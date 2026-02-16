@@ -101,15 +101,26 @@ resource "aws_security_group" "alb_sg" {
   }
 }
 
-# Security group for EC2: allow 8080 only from ALB
+# Security group for EC2 app instances (only when NOT using ECS).
 resource "aws_security_group" "ec2_sg" {
-  name   = "${var.project}-${var.env}-ec2-sg"
-  vpc_id = aws_vpc.this.id
+  count       = var.enable_ecs ? 0 : 1
+  name        = "${var.project}-${var.env}-ec2-sg"
+  vpc_id      = aws_vpc.this.id
   ingress {
     from_port       = 8080
     to_port         = 8080
     protocol        = "tcp"
     security_groups = [aws_security_group.alb_sg.id]
+  }
+  dynamic "ingress" {
+    for_each = var.enable_bastion ? [1] : []
+    content {
+      from_port       = 22
+      to_port         = 22
+      protocol        = "tcp"
+      security_groups = [aws_security_group.bastion_sg[0].id]
+      description     = "SSH from bastion (for ssh_script deploy)"
+    }
   }
   egress {
     from_port   = 0

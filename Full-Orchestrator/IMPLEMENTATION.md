@@ -246,13 +246,40 @@ terraform init -backend-config=backend.hcl -reconfigure
 terraform apply -auto-approve -var-file=prod.tfvars
 ```
 
-### 6.4 OIDC and GitHub Actions
 
-Create the OIDC IAM role for your GitHub repo (see CICD-With-AI’s RUN_COMMANDS_ORDER.md §3a), then add repo secrets: `AWS_ROLE_TO_ASSUME`, `AWS_REGION`.
+### 6.4 Optional bastion host (SSH to private instances)
 
-### 6.5 Build and deploy
+If you use **DEPLOY_METHOD=ssh_script** (e.g. from Multi-Agent-Pipeline) and your app instances are in **private subnets**, you can enable an optional bastion so your local machine can SSH via ProxyJump (local → bastion → instance).
+
+1. **Create an EC2 key pair** in AWS (EC2 → Key pairs) if you do not have one. Use the same key for the bastion and for SSH deploy (e.g. `test-ai-ec2-key`).
+2. **Edit** `infra/envs/prod/prod.tfvars` (and `infra/envs/dev/dev.tfvars` if you want a dev bastion): set `enable_bastion = true`, `key_name = "YOUR_AWS_KEY_PAIR_NAME"` (must match the key pair name in AWS and your `.pem`), and optionally `allowed_bastion_cidr = "YOUR_IP/32"`.
+3. **Apply** (or re-apply): from `infra/envs/prod` run `terraform apply -auto-approve -var-file=prod.tfvars`.
+4. **In the pipeline** (Multi-Agent-Pipeline): set **DEPLOY_METHOD=ssh_script** and **SSH_KEY_PATH** (path to your `.pem`). You can **leave BASTION_HOST unset**—the pipeline auto-reads `bastion_public_ip` from Terraform output (`infra/envs/prod` or `infra/envs/dev`), so you do not need to update `.env` when the bastion IP changes (e.g. after stop/start). Optionally set **BASTION_HOST** to override, and **BASTION_USER=ec2-user** if needed.
+
+Generated `prod.tfvars` and `dev.tfvars` include `enable_bastion = false`, `key_name = ""`, `allowed_bastion_cidr = "0.0.0.0/0"`; change them as above to enable the bastion.
+
+### 6.5 OIDC and GitHub Actions
+
+Create the OIDC IAM role for your GitHub repo (see CICD-With-AI's RUN_COMMANDS_ORDER.md §3a), then add repo secrets: `AWS_ROLE_TO_ASSUME`, `AWS_REGION`.
+
+### 6.6 Build and deploy
 
 Push to `main`; workflows under `.github/workflows/` run on path filters (e.g. `app/**` for build-push). Then run CodeDeploy or Ansible per your setup.
+
+### 6.7 Teardown (destroy resources)
+
+From the generated project root, destroy in reverse order (prod → dev → bootstrap):
+
+```bash
+cd infra/envs/prod
+terraform destroy -auto-approve -var-file=prod.tfvars
+
+cd ../dev
+terraform destroy -auto-approve -var-file=dev.tfvars
+
+cd ../../bootstrap
+terraform destroy -auto-approve
+```
 
 ---
 
@@ -644,9 +671,9 @@ jobs:
           aws ssm put-parameter --name "/bluegreen/prod/image_tag" --value "$TAG" --type String --overwrite --region $AWS_REGION
 ```
 
-### 7.14 Full platform module
+### 7.14 Platform module (and optional bastion)
 
-The Full-Orchestrator writes a **simplified** platform module (SSM parameters only). For a **full** platform (VPC, ALB, ASG, ECR, CodeDeploy, alarms, etc.), copy the module from **CICD-With-AI/infra/modules/platform/** into your generated `infra/modules/platform/` and adjust variables to match your `variables.tf`. See **CICD-With-AI** for the complete Terraform files.
+If **crew-DevOps/infra/modules/platform** (or the repo’s equivalent path) exists, the Full-Orchestrator **copies** the full platform module from there into the generated project. That module includes VPC, ALB, ASG, ECR, CodeDeploy, alarms, and an **optional bastion host** (see [§6.4 Optional bastion host](#64-optional-bastion-host-ssh-to-private-instances)). Generated **prod.tfvars** and **dev.tfvars** include `enable_bastion`, `key_name`, and `allowed_bastion_cidr`; set them and re-apply to create the bastion and use `bastion_public_ip` (e.g. as **BASTION_HOST** in the pipeline). If the platform source directory does not exist, the orchestrator writes a minimal placeholder (SSM only); add the full module from the repo and re-run to get the full platform.
 
 ---
 
@@ -657,6 +684,6 @@ The Full-Orchestrator writes a **simplified** platform module (SSM parameters on
 | 1 | Create venv and `pip install -r requirements.txt` |
 | 2 | Copy `.env.example` to `.env`, set `OPENAI_API_KEY`; edit `requirements.json` |
 | 3 | Run `python run.py` (or with custom requirements path and `--output-dir`) |
-| 4 | Follow `RUN_ORDER.md` in the output directory: bootstrap → dev → prod → OIDC → build/deploy |
+| 4 | Follow `RUN_ORDER.md` in the output directory: bootstrap → dev → prod → (optional bastion) → OIDC → build/deploy |
 
 For **concepts** and **why** the orchestrator works this way, see **EXPLANATION.md**.

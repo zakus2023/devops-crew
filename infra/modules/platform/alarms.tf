@@ -21,7 +21,9 @@ resource "aws_cloudwatch_metric_alarm" "alb_5xx" {
   alarm_actions = [aws_sns_topic.alerts.arn]
 }
 
+# Unhealthy-hosts alarm only when using EC2 blue/green target groups (not ECS).
 resource "aws_cloudwatch_metric_alarm" "unhealthy_hosts" {
+  count               = var.enable_ecs ? 0 : 1
   alarm_name          = "${var.project}-${var.env}-unhealthy-targets"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
@@ -32,7 +34,7 @@ resource "aws_cloudwatch_metric_alarm" "unhealthy_hosts" {
   threshold           = 0
   dimensions = {
     LoadBalancer = aws_lb.app.arn_suffix
-    TargetGroup  = aws_lb_target_group.blue.arn_suffix
+    TargetGroup  = aws_lb_target_group.blue[0].arn_suffix
   }
   alarm_actions = [aws_sns_topic.alerts.arn]
 }
@@ -50,7 +52,9 @@ resource "aws_cloudwatch_metric_alarm" "latency" {
   alarm_actions = [aws_sns_topic.alerts.arn]
 }
 
+# EC2-specific alarms only when NOT using ECS.
 resource "aws_cloudwatch_metric_alarm" "cpu" {
+  count               = var.enable_ecs ? 0 : 1
   alarm_name          = "${var.project}-${var.env}-ec2-cpu"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
@@ -63,6 +67,7 @@ resource "aws_cloudwatch_metric_alarm" "cpu" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "disk" {
+  count               = var.enable_ecs ? 0 : 1
   alarm_name          = "${var.project}-${var.env}-disk-used"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2

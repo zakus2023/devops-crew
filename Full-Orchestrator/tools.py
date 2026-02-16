@@ -84,21 +84,34 @@ def create_orchestrator_tools(output_dir: str, requirements: Dict[str, Any]) -> 
 
     # --- Validation / utility tools (take input from the agent) ---
 
-    @tool("Run 'terraform validate' in a Terraform directory. Input: path relative to output dir, e.g. 'infra/bootstrap' or 'infra/envs/dev'. Returns validation result.")
+    @tool("Run 'terraform init' then 'terraform validate' in a Terraform directory. Input: path relative to output dir, e.g. 'infra/bootstrap' or 'infra/envs/dev'. Uses -backend=false so validation works without bootstrap apply. Returns validation result.")
     def tool_terraform_validate(relative_path: str) -> str:
-        """Run terraform validate in the given path."""
-        # Build full path: output_dir + relative_path (e.g. output/infra/bootstrap).
+        """Run terraform init then terraform validate in the given path. Init uses -backend=false so providers/modules are installed and validate succeeds without a real backend."""
         work_dir = os.path.join(out, relative_path)
         if not os.path.isdir(work_dir):
             return f"Error: directory not found: {work_dir}"
         try:
-            # Run: terraform validate in that directory; capture stdout/stderr; 30s timeout.
+            # Run terraform init -backend=false -reconfigure so we never use a cached S3 backend
+            # (e.g. from a previous init -backend-config=backend.hcl). Validation then works without bootstrap.
+            init_result = subprocess.run(
+                ["terraform", "init", "-backend=false", "-reconfigure"],
+                cwd=work_dir,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if init_result.returncode != 0:
+                return (
+                    f"terraform init in {relative_path}: FAIL\n"
+                    f"stdout: {init_result.stdout}\nstderr: {init_result.stderr}"
+                )
+            # Then run terraform validate.
             result = subprocess.run(
                 ["terraform", "validate"],
-                cwd=work_dir,           # Run from the Terraform directory.
-                capture_output=True,    # Capture stdout and stderr (don't print to console).
-                text=True,              # Return output as string, not bytes.
-                timeout=30,             # Fail if terraform hangs.
+                cwd=work_dir,
+                capture_output=True,
+                text=True,
+                timeout=30,
             )
             if result.returncode == 0:
                 return f"terraform validate in {relative_path}: OK"
@@ -106,7 +119,7 @@ def create_orchestrator_tools(output_dir: str, requirements: Dict[str, Any]) -> 
         except FileNotFoundError:
             return "Error: terraform not found in PATH. Install Terraform to validate."
         except subprocess.TimeoutExpired:
-            return f"Error: terraform validate timed out in {relative_path}"
+            return f"Error: terraform init or validate timed out in {relative_path}"
         except Exception as e:
             return f"Error: {type(e).__name__}: {str(e)}"
 

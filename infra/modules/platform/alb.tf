@@ -6,7 +6,9 @@ resource "aws_lb" "app" {
   security_groups    = [aws_security_group.alb_sg.id]
 }
 
+# Blue/green target groups and test listener only when NOT using ECS (EC2/CodeDeploy/ssh_script path).
 resource "aws_lb_target_group" "blue" {
+  count    = var.enable_ecs ? 0 : 1
   name     = "${var.project}-${var.env}-tg-blue"
   port     = 8080
   protocol = "HTTP"
@@ -22,6 +24,7 @@ resource "aws_lb_target_group" "blue" {
 }
 
 resource "aws_lb_target_group" "green" {
+  count    = var.enable_ecs ? 0 : 1
   name     = "${var.project}-${var.env}-tg-green"
   port     = 8080
   protocol = "HTTP"
@@ -58,16 +61,18 @@ resource "aws_lb_listener" "https" {
   certificate_arn   = aws_acm_certificate_validation.cert.certificate_arn
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.blue.arn
+    target_group_arn = var.enable_ecs ? aws_lb_target_group.ecs[0].arn : aws_lb_target_group.blue[0].arn
   }
 }
 
+# Test listener (port 9001) for blue/green only when using EC2 path.
 resource "aws_lb_listener" "test" {
+  count             = var.enable_ecs ? 0 : 1
   load_balancer_arn = aws_lb.app.arn
   port              = 9001
   protocol          = "HTTP"
   default_action {
     type             = "forward"
-    target_group_arn = aws_lb_target_group.green.arn
+    target_group_arn = aws_lb_target_group.green[0].arn
   }
 }

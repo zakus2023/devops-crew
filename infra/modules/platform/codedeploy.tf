@@ -1,10 +1,13 @@
+# CodeDeploy and artifacts bucket only when NOT using ECS (EC2 blue/green path).
 resource "aws_s3_bucket" "artifacts" {
+  count         = var.enable_ecs ? 0 : 1
   bucket_prefix = "${var.project}-${var.env}-codedeploy-"
   force_destroy = true
 }
 
 resource "aws_s3_bucket_public_access_block" "artifacts" {
-  bucket                  = aws_s3_bucket.artifacts.id
+  count                   = var.enable_ecs ? 0 : 1
+  bucket                  = aws_s3_bucket.artifacts[0].id
   block_public_acls       = true
   block_public_policy     = true
   ignore_public_acls      = true
@@ -12,6 +15,7 @@ resource "aws_s3_bucket_public_access_block" "artifacts" {
 }
 
 data "aws_iam_policy_document" "codedeploy_assume" {
+  count = var.enable_ecs ? 0 : 1
   statement {
     actions = ["sts:AssumeRole"]
     principals {
@@ -22,16 +26,19 @@ data "aws_iam_policy_document" "codedeploy_assume" {
 }
 
 resource "aws_iam_role" "codedeploy_role" {
-  name               = "${var.project}-${var.env}-codedeploy-role"
-  assume_role_policy = data.aws_iam_policy_document.codedeploy_assume.json
+  count                = var.enable_ecs ? 0 : 1
+  name                 = "${var.project}-${var.env}-codedeploy-role"
+  assume_role_policy   = data.aws_iam_policy_document.codedeploy_assume[0].json
 }
 
 resource "aws_iam_role_policy_attachment" "codedeploy" {
-  role       = aws_iam_role.codedeploy_role.name
+  count      = var.enable_ecs ? 0 : 1
+  role       = aws_iam_role.codedeploy_role[0].name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole"
 }
 
 resource "aws_iam_policy" "codedeploy_autoscaling" {
+  count  = var.enable_ecs ? 0 : 1
   name   = "${var.project}-${var.env}-codedeploy-autoscaling"
   policy = jsonencode({
     Version = "2012-10-17"
@@ -55,28 +62,29 @@ resource "aws_iam_policy" "codedeploy_autoscaling" {
 }
 
 resource "aws_iam_role_policy_attachment" "codedeploy_autoscaling" {
-  role       = aws_iam_role.codedeploy_role.name
-  policy_arn = aws_iam_policy.codedeploy_autoscaling.arn
+  count      = var.enable_ecs ? 0 : 1
+  role       = aws_iam_role.codedeploy_role[0].name
+  policy_arn = aws_iam_policy.codedeploy_autoscaling[0].arn
 }
 
 resource "aws_iam_role_policy_attachment" "codedeploy_autoscaling_full" {
-  role       = aws_iam_role.codedeploy_role.name
+  count      = var.enable_ecs ? 0 : 1
+  role       = aws_iam_role.codedeploy_role[0].name
   policy_arn = "arn:aws:iam::aws:policy/AutoScalingFullAccess"
 }
 
-
 resource "aws_codedeploy_app" "app" {
-  name             = "${var.project}-${var.env}-codedeploy-app"
-  compute_platform = "Server"
+  count              = var.enable_ecs ? 0 : 1
+  name               = "${var.project}-${var.env}-codedeploy-app"
+  compute_platform   = "Server"
 }
 
 resource "aws_codedeploy_deployment_group" "dg" {
-  app_name              = aws_codedeploy_app.app.name
-  deployment_group_name = "${var.project}-${var.env}-dg"
-  service_role_arn      = aws_iam_role.codedeploy_role.arn
-  # DISCOVER_EXISTING: use pre-created blue + green ASGs (no CreateAutoScalingGroup by CodeDeploy).
-  # Use COPY_AUTO_SCALING_GROUP only if CodeDeploy role can create ASGs and you want dynamic green fleet.
-  autoscaling_groups    = [aws_autoscaling_group.blue.name, aws_autoscaling_group.green.name]
+  count                  = var.enable_ecs ? 0 : 1
+  app_name               = aws_codedeploy_app.app[0].name
+  deployment_group_name  = "${var.project}-${var.env}-dg"
+  service_role_arn       = aws_iam_role.codedeploy_role[0].arn
+  autoscaling_groups     = [aws_autoscaling_group.blue[0].name, aws_autoscaling_group.green[0].name]
   deployment_style {
     deployment_type   = "BLUE_GREEN"
     deployment_option = "WITH_TRAFFIC_CONTROL"
@@ -96,10 +104,10 @@ resource "aws_codedeploy_deployment_group" "dg" {
   }
   load_balancer_info {
     target_group_info {
-      name = aws_lb_target_group.blue.name
+      name = aws_lb_target_group.blue[0].name
     }
     target_group_info {
-      name = aws_lb_target_group.green.name
+      name = aws_lb_target_group.green[0].name
     }
   }
   auto_rollback_configuration {
@@ -111,7 +119,7 @@ resource "aws_codedeploy_deployment_group" "dg" {
     ignore_poll_alarm_failure = true
     alarms                   = var.enable_deployment_alarms ? [
       aws_cloudwatch_metric_alarm.alb_5xx.alarm_name,
-      aws_cloudwatch_metric_alarm.unhealthy_hosts.alarm_name,
+      aws_cloudwatch_metric_alarm.unhealthy_hosts[0].alarm_name,
     ] : []
   }
 }

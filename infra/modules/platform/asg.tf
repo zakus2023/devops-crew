@@ -54,14 +54,17 @@ locals {
   EOF
 }
 
+# Launch template and ASGs only when NOT using ECS (EC2/CodeDeploy/ssh_script path).
 resource "aws_launch_template" "lt" {
+  count         = var.enable_ecs ? 0 : 1
   name_prefix   = "${var.project}-${var.env}-lt-"
   image_id      = local.ami
   instance_type = var.instance_type
+  key_name      = var.key_name != "" ? var.key_name : null
   iam_instance_profile {
-    name = aws_iam_instance_profile.ec2_profile.name
+    name = aws_iam_instance_profile.ec2_profile[0].name
   }
-  vpc_security_group_ids = [aws_security_group.ec2_sg.id]
+  vpc_security_group_ids = [aws_security_group.ec2_sg[0].id]
   user_data              = base64encode(local.user_data)
   tag_specifications {
     resource_type = "instance"
@@ -73,22 +76,23 @@ resource "aws_launch_template" "lt" {
 }
 
 resource "aws_autoscaling_group" "blue" {
-  name                = "${var.project}-${var.env}-asg-blue"
-  min_size            = var.min_size
-  max_size            = var.max_size
-  desired_capacity    = var.desired_capacity
-  vpc_zone_identifier = aws_subnet.private[*].id
-  target_group_arns   = [aws_lb_target_group.blue.arn]
+  count                       = var.enable_ecs ? 0 : 1
+  name                        = "${var.project}-${var.env}-asg-blue"
+  min_size                    = var.min_size
+  max_size                    = var.max_size
+  desired_capacity            = var.desired_capacity
+  vpc_zone_identifier         = aws_subnet.private[*].id
+  target_group_arns          = [aws_lb_target_group.blue[0].arn]
+  wait_for_capacity_timeout  = "0"
   instance_refresh {
     strategy = "Rolling"
-    triggers = ["launch_template"]
     preferences {
       min_healthy_percentage = 50
       instance_warmup        = 180
     }
   }
   launch_template {
-    id      = aws_launch_template.lt.id
+    id      = aws_launch_template.lt[0].id
     version = "$Latest"
   }
   tag {
@@ -104,22 +108,23 @@ resource "aws_autoscaling_group" "blue" {
 }
 
 resource "aws_autoscaling_group" "green" {
-  name                = "${var.project}-${var.env}-asg-green"
-  min_size            = var.min_size
-  max_size            = var.max_size
-  desired_capacity    = var.desired_capacity
-  vpc_zone_identifier = aws_subnet.private[*].id
-  target_group_arns   = [aws_lb_target_group.green.arn]
+  count                       = var.enable_ecs ? 0 : 1
+  name                        = "${var.project}-${var.env}-asg-green"
+  min_size                    = var.min_size
+  max_size                    = var.max_size
+  desired_capacity            = var.desired_capacity
+  vpc_zone_identifier         = aws_subnet.private[*].id
+  target_group_arns          = [aws_lb_target_group.green[0].arn]
+  wait_for_capacity_timeout  = "0"
   instance_refresh {
     strategy = "Rolling"
-    triggers = ["launch_template"]
     preferences {
       min_healthy_percentage = 50
       instance_warmup        = 180
     }
   }
   launch_template {
-    id      = aws_launch_template.lt.id
+    id      = aws_launch_template.lt[0].id
     version = "$Latest"
   }
   tag {

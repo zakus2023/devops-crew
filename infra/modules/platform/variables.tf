@@ -46,3 +46,28 @@ variable "enable_deployment_alarms" {
   type    = bool
   default = true
 }
+
+# Optional bastion host for SSH deploy (DEPLOY_METHOD=ssh_script) from your machine to private instances.
+variable "enable_bastion" {
+  type    = bool
+  default = false
+}
+
+# Key pair name for bastion and app instances (required if enable_bastion = true; recommended for ssh_script deploy).
+variable "key_name" {
+  type    = string
+  default = ""
+}
+
+# CIDR allowed to SSH to the bastion (e.g. "0.0.0.0/0" or your office IP/32).
+variable "allowed_bastion_cidr" {
+  type    = string
+  default = "0.0.0.0/0"
+}
+
+# Optional ECS (Fargate) deploy target. When true, creates cluster, service, task definition, and ALB listener rule.
+# Pipeline DEPLOY_METHOD=ecs uses ecs_cluster_name and ecs_service_name (from Terraform outputs or SSM).
+variable "enable_ecs" {
+  type    = bool
+  default = false
+}
