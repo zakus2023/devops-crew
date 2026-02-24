@@ -1,6 +1,7 @@
 data "aws_caller_identity" "current" {}
 
 resource "aws_cloudtrail" "trail" {
+  count                         = var.enable_cloudtrail ? 1 : 0
   name                          = "${var.project}-${var.env}-trail"
   s3_bucket_name                = var.cloudtrail_bucket
   include_global_service_events = true

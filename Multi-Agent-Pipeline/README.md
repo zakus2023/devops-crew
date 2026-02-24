@@ -21,13 +21,13 @@ python run.py
 
 Pipeline order: **Infra (Terraform)** → **Build (Docker + ECR + SSM)** → **Deploy** → **Verify (health + SSM)**.
 
-Set `ALLOW_TERRAFORM_APPLY=1` to allow Terraform apply. Set **DEPLOY_METHOD** to choose how Deploy runs: **codedeploy**, **ansible**, **ssh_script**, or **ecs**.
+Set `ALLOW_TERRAFORM_APPLY=1` to allow Terraform apply. Set **DEPLOY_METHOD** to choose how Deploy runs: **ansible**, **ssh_script**, or **ecs**.
 
 ---
 
 ## Quick path: ssh_script deploy (step-by-step)
 
-If you want to deploy via **SSH** (no Ansible, no CodeDeploy), follow these steps. The pipeline will SSH into each EC2 instance tagged `Env=prod`, pull the new image from ECR, and run the app container.
+If you want to deploy via **SSH** (no Ansible), follow these steps. The pipeline will SSH into each EC2 instance tagged `Env=prod`, pull the new image from ECR, and run the app container.
 
 | Step | Action |
 |------|--------|
@@ -99,8 +99,7 @@ AWS_REGION=us-east-1
 # Set to 1 to allow Terraform apply (default: plan only)
 # ALLOW_TERRAFORM_APPLY=1
 
-# Deploy method: codedeploy or ansible (deploy agent uses this to choose which tool to run)
-# DEPLOY_METHOD=codedeploy
+# Deploy method: ansible | ssh_script | ecs (deploy agent uses this to choose which tool to run)
 # DEPLOY_METHOD=ansible
 
 # LLM for CrewAI (required)
@@ -124,7 +123,7 @@ __pycache__/
 
 ### Step 4 — Create `tools.py`
 
-All tools run relative to `repo_root` (set by `set_repo_root` in flow). Tools: Terraform init/plan/apply, Docker build, ECR push + SSM, read SSM, Ansible deploy, CodeDeploy trigger, HTTP health check.
+All tools run relative to `repo_root` (set by `set_repo_root` in flow). Tools: Terraform init/plan/apply, Docker build, ECR push + SSM, read SSM, Ansible deploy, SSH deploy, ECS deploy, HTTP health check.
 
 **File: `Multi-Agent-Pipeline/tools.py`**
 
@@ -386,7 +385,7 @@ def http_health_check(url: str, timeout_seconds: int = 10) -> str:
 
 ### Step 5 — Create `agents.py`
 
-Four agents, each with a subset of tools: Infra Engineer (Terraform), Build Engineer (Docker, ECR, SSM), Deploy Engineer (CodeDeploy, Ansible, SSM), Verifier (health, SSM).
+Four agents, each with a subset of tools: Infra Engineer (Terraform), Build Engineer (Docker, ECR, SSM), Deploy Engineer (Ansible, SSH script, ECS), Verifier (health, SSM).
 
 **File: `Multi-Agent-Pipeline/agents.py`**
 
@@ -395,7 +394,7 @@ Four agents, each with a subset of tools: Infra Engineer (Terraform), Build Engi
 Multi-Agent Deploy Pipeline: four specialist agents.
 - Infra Engineer: Terraform init, plan, apply (bootstrap, dev, prod).
 - Build Engineer: Docker build, ECR push, SSM image_tag update.
-- Deploy Engineer: Trigger CodeDeploy or Ansible (via DEPLOY_METHOD).
+- Deploy Engineer: Ansible, SSH script, or ECS (via DEPLOY_METHOD).
 - Verifier: HTTP health check and SSM read to confirm deployment.
 """
 from crewai import Agent
@@ -472,7 +471,7 @@ def create_pipeline_crew(repo_root: str, prod_url: str, aws_region: str) -> Crew
     Create a crew with four tasks in order:
     1. Infra: Terraform init/plan/(apply if allowed) for bootstrap, dev, prod.
     2. Build: Docker build, ECR push, SSM image_tag update.
-    3. Deploy: CodeDeploy or Ansible (via DEPLOY_METHOD).
+    3. Deploy: Ansible, SSH script, or ECS (via DEPLOY_METHOD).
     4. Verify: HTTP health check and SSM read.
     """
     from tools import set_repo_root
@@ -632,7 +631,7 @@ python run.py
 
 Or: `python run.py https://your-prod-url`
 
-Optional: set `ALLOW_TERRAFORM_APPLY=1` to allow apply; set `DEPLOY_METHOD=codedeploy` or `DEPLOY_METHOD=ansible` for the deploy step.
+Optional: set `ALLOW_TERRAFORM_APPLY=1` to allow apply; set `DEPLOY_METHOD=ansible`, `DEPLOY_METHOD=ssh_script`, or `DEPLOY_METHOD=ecs` for the deploy step.
 
 ---
 
@@ -643,7 +642,7 @@ Optional: set `ALLOW_TERRAFORM_APPLY=1` to allow apply; set `DEPLOY_METHOD=coded
 | 1     | `requirements.txt` | Python deps (CrewAI, requests, boto3, python-dotenv). |
 | 2     | `.env.example` | Template for .env (PROD_URL, AWS_REGION, REPO_ROOT, ALLOW_TERRAFORM_APPLY, DEPLOY_METHOD, OPENAI_API_KEY). |
 | 3     | `.gitignore`   | Ignore .venv, .env, __pycache__, *.pyc. |
-| 4     | `tools.py`     | set_repo_root, get_repo_root; Terraform init/plan/apply, docker_build, ecr_push_and_ssm, read_ssm_parameter, run_ansible_deploy, trigger_codedeploy, http_health_check. |
+| 4     | `tools.py`     | set_repo_root, get_repo_root; Terraform init/plan/apply, docker_build, ecr_push_and_ssm, read_ssm_parameter, run_ansible_deploy, run_ssh_deploy, run_ecs_deploy, http_health_check. |
 | 5     | `agents.py`    | infra_engineer, build_engineer, deploy_engineer, verifier_agent (each with its tools). |
 | 6     | `flow.py`      | create_pipeline_crew(repo_root, prod_url, aws_region): four tasks in order, set_repo_root, return Crew. |
 | 7     | `run.py`       | Parse PROD_URL (env/CLI), REPO_ROOT default, create crew, kickoff, print result. |

@@ -105,6 +105,9 @@ resource "aws_autoscaling_group" "blue" {
     value               = var.env
     propagate_at_launch = true
   }
+  lifecycle {
+    ignore_changes = [desired_capacity]
+  }
 }
 
 resource "aws_autoscaling_group" "green" {
@@ -136,5 +139,8 @@ resource "aws_autoscaling_group" "green" {
     key                 = "Env"
     value               = var.env
     propagate_at_launch = true
+  }
+  lifecycle {
+    ignore_changes = [desired_capacity]
   }
 }

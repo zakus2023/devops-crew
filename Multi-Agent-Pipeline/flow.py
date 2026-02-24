@@ -13,7 +13,7 @@ def create_pipeline_crew(repo_root: str, prod_url: str, aws_region: str, app_roo
     Create a crew with four tasks in order:
     1. Infra: Terraform init/plan/(apply if allowed) for bootstrap, dev, prod.
     2. Build: Docker build, ECR push, SSM image_tag update.
-    3. Deploy: Trigger CodeDeploy or report deploy steps.
+    3. Deploy: Trigger deployment or report deploy steps.
     4. Verify: HTTP health check and SSM read.
 
     app_root: optional path to app directory (e.g. crew-DevOps/app). When set, build uses this instead of repo_root/app.
@@ -30,8 +30,8 @@ def create_pipeline_crew(repo_root: str, prod_url: str, aws_region: str, app_roo
 Do in order (only apply if ALLOW_TERRAFORM_APPLY=1):
 1. infra/bootstrap: terraform_init("infra/bootstrap"), then terraform_plan("infra/bootstrap"). If ALLOW_TERRAFORM_APPLY=1, terraform_apply("infra/bootstrap").
 2. After bootstrap apply (if you applied): call update_backend_from_bootstrap() so dev and prod backend.hcl and tfvars get the real tfstate_bucket, tflock_table, and cloudtrail_bucket from bootstrap outputs. Then dev/prod init will find the S3 bucket.
-3. infra/envs/dev: terraform_init("infra/envs/dev", "backend.hcl"), terraform_plan("infra/envs/dev", "dev.tfvars"). If allowed, terraform_apply("infra/envs/dev", "dev.tfvars").
-4. infra/envs/prod: terraform_init("infra/envs/prod", "backend.hcl"), terraform_plan("infra/envs/prod", "prod.tfvars"). If allowed, terraform_apply("infra/envs/prod", "prod.tfvars").
+3. infra/envs/dev: terraform_init("infra/envs/dev", "backend.hcl"), terraform_plan("infra/envs/dev", "dev.tfvars"). If allowed, terraform_apply("infra/envs/dev", "dev.tfvars"). If apply fails with EntityAlreadyExists for IAM Role, call run_import_platform_iam_on_conflict("infra/envs/dev", "dev.tfvars") then retry.
+4. infra/envs/prod: terraform_init("infra/envs/prod", "backend.hcl"), terraform_plan("infra/envs/prod", "prod.tfvars"). If allowed, call run_resolve_aws_limits and run_remove_terraform_blockers, then terraform_apply("infra/envs/prod", "prod.tfvars"). If apply fails with EntityAlreadyExists for IAM Role, call run_import_platform_iam_on_conflict("infra/envs/prod", "prod.tfvars") then retry terraform_apply. If apply times out or fails partway (e.g. only bastion created, no ASG), run terraform_apply again.
 
 Summarize: what was planned/applied and any errors. If apply was skipped, say so and remind the user to set ALLOW_TERRAFORM_APPLY=1 to apply.""",
         expected_output="Summary of Terraform init/plan/(apply) for bootstrap, dev, prod: success or failure for each, and whether apply was run or skipped.",
@@ -52,25 +52,21 @@ If docker or ECR fails (e.g. tag immutable), retry with a new unique tag. Summar
         context=[task_infra],
     )
 
-    # Deploy method is chosen automatically from .env DEPLOY_METHOD (codedeploy | ansible | ssh_script | ecs).
+    # Deploy method is chosen automatically from .env DEPLOY_METHOD (ansible | ssh_script | ecs).
     deploy_method = (os.environ.get("DEPLOY_METHOD") or "").strip().lower()
     if deploy_method == "ssh_script":
         deploy_instruction = (
             f'Use only SSH deploy. Call run_ssh_deploy(env="prod", region="{aws_region}"). '
-            f'Requires SSH_KEY_PATH or SSH_PRIVATE_KEY; EC2 tagged Env=prod (or Env=dev), reachable on port 22. Do NOT use Ansible, CodeDeploy, or ECS.'
+            f'Requires SSH_KEY_PATH or SSH_PRIVATE_KEY; EC2 tagged Env=prod (or Env=dev), reachable on port 22. Do NOT use Ansible or ECS.'
         )
     elif deploy_method == "ecs":
         deploy_instruction = (
-            f'Use only ECS deploy. Get ecs_cluster_name and ecs_service_name: first try get_terraform_output("ecs_cluster_name", "infra/envs/prod") and get_terraform_output("ecs_service_name", "infra/envs/prod"). If either is not found, use read_ssm_parameter("/bluegreen/prod/ecs_cluster_name", region="{aws_region}") and read_ssm_parameter("/bluegreen/prod/ecs_service_name", region="{aws_region}"). If both Terraform outputs and SSM parameters are missing, in your final answer tell the user: ECS is not enabled — set enable_ecs = true in infra/envs/prod/prod.tfvars, run terraform apply for prod (or re-run with ALLOW_TERRAFORM_APPLY=1), then re-run; or set DEPLOY_METHOD=ssh_script in .env to deploy via SSH. When cluster and service are found, call run_ecs_deploy(cluster_name=..., service_name=..., region="{aws_region}"). Do NOT use Ansible, CodeDeploy, or ssh_script.'
-        )
-    elif deploy_method == "codedeploy":
-        deploy_instruction = (
-            f'Use only CodeDeploy. Get codedeploy_app and codedeploy_group from get_terraform_output("codedeploy_app", "infra/envs/prod") and get_terraform_output("codedeploy_group", "infra/envs/prod"), then trigger_codedeploy with s3_bucket and s3_key. Do NOT use Ansible, ECS, or ssh_script.'
+            f'Use only ECS deploy. Get ecs_cluster_name and ecs_service_name: first try get_terraform_output("ecs_cluster_name", "infra/envs/prod") and get_terraform_output("ecs_service_name", "infra/envs/prod"). If either is not found, use read_ssm_parameter("/bluegreen/prod/ecs_cluster_name", region="{aws_region}") and read_ssm_parameter("/bluegreen/prod/ecs_service_name", region="{aws_region}"). If both Terraform outputs and SSM parameters are missing, in your final answer tell the user: ECS is not enabled — set enable_ecs = true in infra/envs/prod/prod.tfvars, run terraform apply for prod (or re-run with ALLOW_TERRAFORM_APPLY=1), then re-run; or set DEPLOY_METHOD=ssh_script in .env to deploy via SSH. When cluster and service are found, call run_ecs_deploy(cluster_name=..., service_name=..., region="{aws_region}"). Do NOT use Ansible or ssh_script.'
         )
     else:
         # ansible or unset
         deploy_instruction = (
-            f'Use only Ansible. Get get_terraform_output("artifacts_bucket", "infra/envs/prod"), then run_ansible_deploy(env="prod", ssm_bucket=<that value>, ansible_dir="ansible", region="{aws_region}"). If that fails, in your final answer suggest setting DEPLOY_METHOD=ssh_script or codedeploy or ecs in .env and re-running.'
+            f'Use only Ansible. Get get_terraform_output("artifacts_bucket", "infra/envs/prod"), then run_ansible_deploy(env="prod", ssm_bucket=<that value>, ansible_dir="ansible", region="{aws_region}"). If that fails, in your final answer suggest setting DEPLOY_METHOD=ssh_script or ecs in .env and re-running.'
         )
 
     task_deploy = Task(
@@ -79,16 +75,14 @@ If docker or ECR fails (e.g. tag immutable), retry with a new unique tag. Summar
 Deploy method for this run (from .env DEPLOY_METHOD): **{deploy_method or "ansible"}**
 
 **{deploy_instruction}**""",
-        expected_output="Summary: Deployment triggered (CodeDeploy ID, Ansible result, SSH deploy per-instance status, or ECS update), or clear instructions and current image_tag.",
+        expected_output="Summary: Deployment triggered (Ansible result, SSH deploy per-instance status, or ECS update), or clear instructions and current image_tag.",
         agent=deploy_engineer,
         context=[task_build],
     )
 
-    # Wait before health check so the app is ready: ECS needs longest (new task); codedeploy/ssh/ansible need a short buffer after restart.
+    # Wait before health check so the app is ready: ECS needs longest (new task); ssh/ansible need a short buffer after restart.
     if deploy_method == "ecs":
         wait_before_health = "First call wait_seconds(90) so the new ECS task can become healthy, then call"
-    elif deploy_method == "codedeploy":
-        wait_before_health = "First call wait_seconds(60) so the CodeDeploy rollout can complete, then call"
     elif deploy_method == "ssh_script":
         wait_before_health = "First call wait_seconds(30) so the app can finish restarting on EC2, then call"
     elif deploy_method == "ansible":

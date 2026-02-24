@@ -10,7 +10,7 @@ The **Multi-Agent Deploy Pipeline** is a **CrewAI crew** that runs a **four-step
 
 1. **Terraform** — Init, plan, and (optionally) apply for bootstrap, dev, and prod.
 2. **Build** — Build the Docker image, push to ECR, and update the SSM parameter `/bluegreen/prod/image_tag`.
-3. **Deploy** — Trigger deployment so the new image runs in production. Supported methods: **CodeDeploy**, **Ansible**, **SSH script** (option 2), or **ECS** (option 4). Option 3 (Terraform user_data/cloud-init) is for first-boot only; for ongoing updates you use one of the four methods. See **IMPLEMENTATION.md** for what you must do for each.
+3. **Deploy** — Trigger deployment so the new image runs in production. Supported methods: **Ansible**, **SSH script**, or **ECS**. Option 3 (Terraform user_data/cloud-init) is for first-boot only; for ongoing updates you use one of the three methods. See **IMPLEMENTATION.md** for what you must do for each.
 4. **Verify** — Check the production health URL and SSM parameters to confirm the deployment.
 
 Unlike the **Full-Orchestrator** (which *generates* that project from requirements), this pipeline **executes** real steps: it runs Terraform, Docker, ECR push, SSM updates, and deploy. It uses **four specialist agents**, one per step, that work in sequence.
@@ -43,18 +43,17 @@ Optional:
 - **REPO_ROOT** — Path to your **deployment project** (the directory with `infra/bootstrap`, `infra/envs/dev`, `infra/envs/prod`, `app/`, `deploy/`, `ansible/`). Typically **Full-Orchestrator/output** after running Full-Orchestrator. If unset, the pipeline uses the parent of Multi-Agent-Pipeline (crew-DevOps) as repo root.
 - **APP_ROOT** — Optional path to the app directory for Docker build. When **crew-DevOps/app** exists, run.py uses it automatically for the Build step; otherwise the app is at `REPO_ROOT/app`.
 - **ALLOW_TERRAFORM_APPLY=1** — Allow the infra agent to run `terraform apply`; if unset, only **plan** runs.
-- **DEPLOY_METHOD** — Set to **codedeploy**, **ansible**, **ssh_script**, or **ecs** so the deploy agent runs the chosen method. See [When to use which method](#when-to-use-which-deploy_method) below and **IMPLEMENTATION.md** (§6.3) for details.
+- **DEPLOY_METHOD** — Set to **ansible**, **ssh_script**, or **ecs** so the deploy agent runs the chosen method. See [When to use which method](#when-to-use-which-deploy_method) below and **IMPLEMENTATION.md** (§6.3) for details.
 
 **When to use which DEPLOY_METHOD**
 
-- **ssh_script** — EC2 instances running your app (with or without a bastion), you have an SSH key, and you want the pipeline to SSH in and run Docker (pull image, restart container). No Ansible or CodeDeploy required.
+- **ssh_script** — EC2 instances running your app (with or without a bastion), you have an SSH key, and you want the pipeline to SSH in and run Docker (pull image, restart container). No Ansible required.
 - **ansible** — You have Ansible playbooks and dynamic inventory in the repo; you’re fine installing Ansible and `community.aws`. Good for playbook-based or multi-step deploys.
-- **codedeploy** — You use AWS CodeDeploy (blue/green or in-place) and have a deploy bundle in S3; Terraform gives you the CodeDeploy app and deployment group.
 - **ecs** — Your app runs on ECS (Fargate or EC2); you want the pipeline to update the ECS service with the new image.
 
 #### Using ssh_script deploy (beginner walkthrough)
 
-When **DEPLOY_METHOD=ssh_script**, the Deploy step does **not** use Ansible or CodeDeploy. Instead it:
+When **DEPLOY_METHOD=ssh_script**, the Deploy step does **not** use Ansible. Instead it:
 
 1. **Finds** your EC2 instances in AWS (by tag `Env=prod` or `Env=dev`).
 2. **Connects** to each instance via SSH (directly, or through a **bastion** if instances are in private subnets).
@@ -88,7 +87,7 @@ The crew has **four agents** and **four tasks** in **sequential** order:
 |------|--------|------|
 | 1 | **Infrastructure Engineer** | Run `terraform init` (with backend config for dev/prod), then `terraform plan` for bootstrap, dev, prod. If `ALLOW_TERRAFORM_APPLY=1`, run `terraform apply`. Summarize results. |
 | 2 | **Build Engineer** | Run `docker build` for the app (at APP_ROOT or REPO_ROOT/app), read ECR repo name from SSM, then `ecr_push_and_ssm` to push the image and update `/bluegreen/prod/image_tag`. |
-| 3 | **Deployment Engineer** | Deploy via **CodeDeploy**, **Ansible**, **SSH script** (run_ssh_deploy), or **ECS** (run_ecs_deploy). Uses **DEPLOY_METHOD** to choose the tool. |
+| 3 | **Deployment Engineer** | Deploy via **Ansible**, **SSH script** (run_ssh_deploy), or **ECS** (run_ecs_deploy). Uses **DEPLOY_METHOD** to choose the tool. |
 | 4 | **Deployment Verifier** | Call `http_health_check(PROD_URL/health)` and `read_ssm_parameter` for `/bluegreen/prod/image_tag` and `/bluegreen/prod/ecr_repo_name`. Report pass/fail. |
 
 Each agent has **tools** (functions) it can call. The LLM decides when to call which tool and with what arguments. Task 2 can use the **context** of Task 1 (e.g. "infra is ready"), Task 3 uses context of Task 2, and Task 4 uses context of Task 3.
@@ -103,7 +102,7 @@ At the end you see a **pipeline result** that combines the outputs of all four t
 
 - **Infra Engineer** — Tools: `terraform_init`, `terraform_plan`, `terraform_apply`. Works in `infra/bootstrap`, `infra/envs/dev`, `infra/envs/prod` under REPO_ROOT.
 - **Build Engineer** — Tools: `docker_build`, `ecr_push_and_ssm`, `read_ssm_parameter`. Builds the app (APP_ROOT or REPO_ROOT/app), pushes to ECR, updates SSM.
-- **Deploy Engineer** — Tools: `trigger_codedeploy`, `run_ansible_deploy`, `run_ssh_deploy`, `run_ecs_deploy`, `get_terraform_output`, `read_ssm_parameter`. Uses **DEPLOY_METHOD** (codedeploy | ansible | ssh_script | ecs) to run the matching deploy.
+- **Deploy Engineer** — Tools: `run_ansible_deploy`, `run_ssh_deploy`, `run_ecs_deploy`, `get_terraform_output`, `read_ssm_parameter`. Uses **DEPLOY_METHOD** (ansible | ssh_script | ecs) to run the matching deploy.
 - **Verifier** — Tools: `http_health_check`, `read_ssm_parameter`. Checks the health URL and SSM parameters.
 
 ---
@@ -112,10 +111,10 @@ At the end you see a **pipeline result** that combines the outputs of all four t
 
 - **Python 3.10+** and the dependencies in `requirements.txt`.
 - **A deployment project** — A directory with `infra/` (bootstrap, envs/dev, envs/prod), `app/`, `deploy/`, and `ansible/`. Typically **Full-Orchestrator/output** after you run Full-Orchestrator. Set **REPO_ROOT** to that path (e.g. `REPO_ROOT=../Full-Orchestrator/output`).
-- **AWS credentials** — For Terraform, ECR push, SSM, and CodeDeploy/Ansible. Configure `aws configure` or env vars.
+- **AWS credentials** — For Terraform, ECR push, SSM, and Ansible. Configure `aws configure` or env vars.
 - **PROD_URL** — Your production URL (e.g. from Terraform output `https_url`).
 - **OPENAI_API_KEY** — For CrewAI.
-- **Optional:** Set `ALLOW_TERRAFORM_APPLY=1` to allow Terraform apply. Set **DEPLOY_METHOD** to **codedeploy**, **ansible**, **ssh_script**, or **ecs**; see **IMPLEMENTATION.md** for what you must do for each.
+- **Optional:** Set `ALLOW_TERRAFORM_APPLY=1` to allow Terraform apply. Set **DEPLOY_METHOD** to **ansible**, **ssh_script**, or **ecs**; see **IMPLEMENTATION.md** for what you must do for each.
 
 ---
 
@@ -126,7 +125,7 @@ At the end you see a **pipeline result** that combines the outputs of all four t
 | **Multi-Agent Pipeline** | A CrewAI crew that runs Terraform → Build → Deploy → Verify on a deployment project. |
 | **Deployment project** | A directory (e.g. Full-Orchestrator/output) with infra/, app/, deploy/, ansible/. Set via **REPO_ROOT**. |
 | **Location** | In **crew-DevOps**, next to Full-Orchestrator and Combined-Crew. |
-| **Four agents** | Infra Engineer (Terraform), Build Engineer (Docker/ECR/SSM), Deploy Engineer (CodeDeploy or Ansible), Verifier (health + SSM). |
+| **Four agents** | Infra Engineer (Terraform), Build Engineer (Docker/ECR/SSM), Deploy Engineer (Ansible, SSH script, or ECS), Verifier (health + SSM). |
 | **Sequential flow** | One task per agent; each task can use the previous task's output as context. |
 | **Safety** | Terraform apply only when `ALLOW_TERRAFORM_APPLY=1`; otherwise only plan. |
 

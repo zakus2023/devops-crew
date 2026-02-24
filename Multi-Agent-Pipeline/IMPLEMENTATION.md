@@ -24,7 +24,7 @@ This guide gives you the **exact steps**, **commands**, and **full file contents
 - **Terraform** — Installed and on PATH if you want the infra agent to run init/plan/(apply).
 - **Docker** — Installed and on PATH if you want the build agent to run docker build and push.
 - **Ansible** — Required for the Deploy step when using **DEPLOY_METHOD=ansible** (default). Install Ansible and the `community.aws` collection so `ansible-playbook` is on PATH. See [§1.1 Install Ansible](#11-install-ansible) below.
-- **AWS credentials** — Configured so Terraform, ECR, SSM, and CodeDeploy/Ansible can run.
+- **AWS credentials** — Configured so Terraform, ECR, SSM, and Ansible can run.
 - **OpenAI API key** — For CrewAI (set in `.env`).
 - **Production URL** — Your real prod URL (e.g. from `terraform output -raw https_url` in your deployment project’s `infra/envs/prod`).
 
@@ -44,7 +44,7 @@ Check: `ansible-playbook --version` and `ansible-galaxy collection list | grep c
 
 **Windows:** The Deploy step runs the playbook **inside WSL** by default so Linux Ansible is used (avoids `OSError: [WinError 1] Incorrect function` on Git Bash/MinGW). Install WSL and Ubuntu, install Ansible inside Ubuntu (see **ansible_wsl_setup (1).md**), and leave `ANSIBLE_USE_WSL` unset or set to `1`. To disable and run native Ansible (may fail), set `ANSIBLE_USE_WSL=0` in `.env`. When using WSL, the pipeline passes **AWS credentials** from your current environment into the WSL command so the Ansible dynamic inventory (aws_ec2) can list EC2 instances. If you see **"no hosts matched"**, check (1) AWS credentials, (2) instances running and tagged `Env=prod`/`Env=dev`, (3) region, and optionally set **ANSIBLE_WAIT_BEFORE_DEPLOY=90** after a fresh Terraform apply.
 
-**WSL socket/buffer error (0x80072747):** If Ansible deploy fails with "buffer space" or "queue was full" or `Wsl/Service/0x80072747`, Windows had a socket issue calling WSL. **Workarounds:** (1) Set **ANSIBLE_USE_WSL=0** in `.env` and run again (native Ansible; may hit WinError 1 in some terminals). (2) Run the pipeline **from inside WSL**: open Ubuntu/WSL, `cd` to the repo and Multi-Agent-Pipeline, then `python run.py` (no Windows→WSL call). (3) Restart WSL: `wsl --shutdown`, then open WSL again. (4) Use another deploy method: **DEPLOY_METHOD=ssh_script** (with SSH key and EC2 reachable) or CodeDeploy/ECS if configured.
+**WSL socket/buffer error (0x80072747):** If Ansible deploy fails with "buffer space" or "queue was full" or `Wsl/Service/0x80072747`, Windows had a socket issue calling WSL. **Workarounds:** (1) Set **ANSIBLE_USE_WSL=0** in `.env` and run again (native Ansible; may hit WinError 1 in some terminals). (2) Run the pipeline **from inside WSL**: open Ubuntu/WSL, `cd` to the repo and Multi-Agent-Pipeline, then `python run.py` (no Windows→WSL call). (3) Restart WSL: `wsl --shutdown`, then open WSL again. (4) Use another deploy method: **DEPLOY_METHOD=ssh_script** (with SSH key and EC2 reachable) or ECS if configured.
 
 ---
 
@@ -120,10 +120,10 @@ Optional:
 AWS_REGION=us-east-1
 REPO_ROOT=C:/My-Projects/crew-DevOps/Full-Orchestrator/output
 ALLOW_TERRAFORM_APPLY=0
-DEPLOY_METHOD=ansible    # or codedeploy | ssh_script | ecs (see §6.3 Deploy options)
+DEPLOY_METHOD=ansible    # or ssh_script | ecs (see §6.3 Deploy options)
 ```
 
-Set **REPO_ROOT** to your deployment project (e.g. **Full-Orchestrator/output** after running Full-Orchestrator). If unset, the pipeline uses the parent of Multi-Agent-Pipeline (crew-DevOps) as repo root. **DEPLOY_METHOD** chooses the deploy method: **codedeploy**, **ansible**, **ssh_script**, or **ecs**. See [§6.3 Deploy options (2–4)](#63-deploy-options-2–4-ssh-script-user_data-ecs) for what you must do for each.
+Set **REPO_ROOT** to your deployment project (e.g. **Full-Orchestrator/output** after running Full-Orchestrator). If unset, the pipeline uses the parent of Multi-Agent-Pipeline (crew-DevOps) as repo root. **DEPLOY_METHOD** chooses the deploy method: **ansible**, **ssh_script**, or **ecs**. See [§6.3 Deploy options (2–4)](#63-deploy-options-2–4-ssh-script-user_data-ecs) for what you must do for each.
 
 ### 4.2 Production URL (PROD_URL)
 
@@ -163,7 +163,7 @@ python run.py https://app.my-iifb.click
 
 1. **Infra Engineer** — Runs `terraform init` (with `backend.hcl` for dev/prod) and `terraform plan` for bootstrap, dev, prod in **REPO_ROOT** (your deployment project). If `ALLOW_TERRAFORM_APPLY=1`, runs `terraform apply`; otherwise reports "apply skipped."
 2. **Build Engineer** — Runs `docker build` for the app (APP_ROOT if set, e.g. crew-DevOps/app, else REPO_ROOT/app), reads `/bluegreen/prod/ecr_repo_name` from SSM, then pushes the image to ECR and updates `/bluegreen/prod/image_tag`.
-3. **Deploy Engineer** — Runs deploy per **DEPLOY_METHOD**: CodeDeploy, Ansible, SSH script (run_ssh_deploy), or ECS (run_ecs_deploy).
+3. **Deploy Engineer** — Runs deploy per **DEPLOY_METHOD**: Ansible, SSH script (run_ssh_deploy), or ECS (run_ecs_deploy).
 4. **Verifier** — Calls `http_health_check(PROD_URL/health)` and reads SSM `/bluegreen/prod/image_tag` and `/bluegreen/prod/ecr_repo_name`, then reports pass/fail.
 
 At the end you see **Pipeline result** with a summary of all four steps.
@@ -215,11 +215,10 @@ If the Build step fails with "Cannot connect to the Docker daemon" or "dockerDes
 
 ### 6.3 Deploy options (2–4): SSH script, user_data, ECS
 
-The pipeline supports **four deploy methods**. Set **DEPLOY_METHOD** in `.env` and follow the steps below for the method you use.
+The pipeline supports **three deploy methods**. Set **DEPLOY_METHOD** in `.env` and follow the steps below for the method you use.
 
 | DEPLOY_METHOD | Tool / behavior | What you must do |
 |---------------|-----------------|------------------|
-| **codedeploy** | `trigger_codedeploy` | Have a deploy bundle in S3; Terraform outputs `codedeploy_app`, `codedeploy_group`. |
 | **ansible** | `run_ansible_deploy` | Install Ansible + `community.aws`; Terraform output `artifacts_bucket`; ansible/ with inventory and playbooks. |
 | **ssh_script** | `run_ssh_deploy` | See [Option 2: SSH + script](#option-2-ssh--script-no-ansible) and [Step-by-step (beginner)](#ssh_script-step-by-step-beginner) below. |
 | **ecs** | `run_ecs_deploy` | See [Option 4: ECS](#option-4-ecs-fargate-or-ec2) below. |
@@ -228,18 +227,17 @@ The pipeline supports **four deploy methods**. Set **DEPLOY_METHOD** in `.env` a
 
 | Method | Use when … |
 |--------|------------|
-| **ssh_script** | You have **EC2 instances** (in public or private subnets) running your app, you have an **SSH key** that can reach them (or a bastion), and you want the pipeline to **SSH in and run Docker** (pull new image, stop/start container). No Ansible or CodeDeploy setup needed. Good for: simple EC2 + Docker setups, private subnets with a bastion, or when you prefer “SSH + script” over Ansible. |
+| **ssh_script** | You have **EC2 instances** (in public or private subnets) running your app, you have an **SSH key** that can reach them (or a bastion), and you want the pipeline to **SSH in and run Docker** (pull new image, stop/start container). No Ansible setup needed. Good for: simple EC2 + Docker setups, private subnets with a bastion, or when you prefer “SSH + script” over Ansible. |
 | **ansible** | Your deployment project has an **Ansible playbook** (e.g. `ansible/playbooks/deploy.yml`) and **dynamic inventory** (e.g. `aws_ec2`). You’re okay installing Ansible and the `community.aws` collection. Use when: you already use Ansible for config/deploy, or you want playbook-based deploys (roles, templates, many hosts) and have the `artifacts_bucket` (or similar) from Terraform. |
-| **codedeploy** | Your app is deployed with **AWS CodeDeploy** (e.g. blue/green or in-place). You have a **deploy bundle** (e.g. zip in S3) and Terraform outputs for `codedeploy_app` and `codedeploy_group`. Use when: you rely on CodeDeploy for rollbacks, traffic shifting, or lifecycle hooks, and your build produces an S3 revision for CodeDeploy. |
 | **ecs** | Your app runs on **Amazon ECS** (Fargate or EC2 launch type). Terraform exposes **ecs_cluster_name** and **ecs_service_name**. Use when: you’re on ECS and want the pipeline to update the service with the new image (new task definition + force new deployment). |
 
-**Quick decision:** EC2 + Docker and you have SSH (or bastion) → **ssh_script**. Ansible playbooks already in the repo → **ansible**. CodeDeploy in your Terraform → **codedeploy**. ECS cluster + service → **ecs**.
+**Quick decision:** EC2 + Docker and you have SSH (or bastion) → **ssh_script**. Ansible playbooks already in the repo → **ansible**. ECS cluster + service → **ecs**.
 
 ---
 
 #### ssh_script step-by-step (beginner)
 
-Use this checklist when you want the pipeline to deploy via **SSH** (no Ansible, no CodeDeploy). The deploy agent will SSH into each EC2 instance tagged `Env=prod` (or `Env=dev`), run ECR login, pull the new image, and start the app container.
+Use this checklist when you want the pipeline to deploy via **SSH** (no Ansible). The deploy agent will SSH into each EC2 instance tagged `Env=prod` (or `Env=dev`), run ECR login, pull the new image, and start the app container.
 
 **Step 0 — Required for any run**  
 Set **PROD_URL** and **OPENAI_API_KEY** in `.env` (see [§4 Step 2: Configure environment](#4-step-2-configure-environment)). The pipeline needs these before it runs.
@@ -311,12 +309,12 @@ When **DEPLOY_METHOD=ssh_script**, the deploy agent discovers EC2 instances by t
 **Option 3: Terraform user_data / cloud-init (bootstrap only)**  
 This is **documentation-only**: there is no separate pipeline tool. You can use Terraform to set **user_data** on EC2 (or in a launch template) so that on **first boot** the instance installs Docker, pulls the image from ECR, and runs the container (e.g. via a cloud-init script). That gives you a working app after the first apply.
 
-For **subsequent updates** (new image tags), user_data does not re-run. You must use one of the other deploy methods for ongoing deployments: **Ansible** (`run_ansible_deploy`), **SSH script** (`run_ssh_deploy`), **CodeDeploy** (`trigger_codedeploy`), or **ECS** (`run_ecs_deploy`). So: use user_data for initial bootstrap; set **DEPLOY_METHOD** to ansible, ssh_script, codedeploy, or ecs for the pipeline’s Deploy step.
+For **subsequent updates** (new image tags), user_data does not re-run. You must use one of the other deploy methods for ongoing deployments: **Ansible** (`run_ansible_deploy`), **SSH script** (`run_ssh_deploy`), or **ECS** (`run_ecs_deploy`). So: use user_data for initial bootstrap; set **DEPLOY_METHOD** to ansible, ssh_script, or ecs for the pipeline’s Deploy step.
 
 **What you should do:**
 
 1. In your Terraform (e.g. EC2 instance or launch template), set `user_data` (or `user_data_base64`) to a script that: installs Docker if needed, logs in to ECR, pulls the image (e.g. using a fixed tag or SSM at boot), and runs `docker run` for your app.
-2. For pipeline-driven updates, set **DEPLOY_METHOD** to **ansible**, **ssh_script**, **codedeploy**, or **ecs** and follow the corresponding steps in this doc.
+2. For pipeline-driven updates, set **DEPLOY_METHOD** to **ansible**, **ssh_script**, or **ecs** and follow the corresponding steps in this doc.
 
 **Option 4: ECS (Fargate)**  
 When **DEPLOY_METHOD=ecs**, the deploy agent updates the ECS service to use the new image: it reads `/bluegreen/prod/image_tag` and `/bluegreen/prod/ecr_repo_name` from SSM, registers a new task definition revision with that image, and calls **update_service** with **forceNewDeployment=True**.
@@ -344,7 +342,7 @@ This section describes **what each file does** and **how it should be structured
 
 ### 7.1 `tools.py`
 
-**Purpose:** Provides all tools the agents call: Terraform, Docker, ECR, SSM, CodeDeploy, Ansible, SSH deploy, ECS deploy, and health check. Paths are relative to **repo_root** (the deployment project, e.g. Full-Orchestrator/output).
+**Purpose:** Provides all tools the agents call: Terraform, Docker, ECR, SSM, Ansible, SSH deploy, ECS deploy, and health check. Paths are relative to **repo_root** (the deployment project, e.g. Full-Orchestrator/output).
 
 **How to create it:**
 
@@ -353,7 +351,7 @@ This section describes **what each file does** and **how it should be structured
 3. **Terraform tools** — `terraform_init(relative_path, backend_config=None)`, `terraform_plan(relative_path, var_file=None)`, `terraform_apply(relative_path, var_file=None)`. Each: resolve `work_dir = os.path.join(get_repo_root(), relative_path)`, check directory exists, run `subprocess.run` in `work_dir`, return OK/FAIL string. For apply, only run if `ALLOW_TERRAFORM_APPLY=1`. `update_backend_from_bootstrap()` (no input): run `terraform output -raw` in infra/bootstrap for tfstate_bucket, tflock_table, cloudtrail_bucket; update infra/envs/dev and infra/envs/prod backend.hcl and tfvars with those values so dev/prod init works after the first bootstrap apply.
 4. **Build tools** — `docker_build(app_relative_path="app", tag="latest")` (build in `get_app_root()` or `repo_root/app`); `ecr_push_and_ssm(ecr_repo_name, image_tag, aws_region=None)` (tag image, ECR login, push, put `/bluegreen/prod/image_tag` in SSM).
 5. **Shared** — `read_ssm_parameter(name, region=None)` (boto3 SSM `get_parameter`).
-6. **Deploy tools** — `run_ansible_deploy(env, ssm_bucket, ansible_dir="ansible", region=None)` (run ansible-playbook in repo’s ansible dir); `trigger_codedeploy(application_name, deployment_group_name, s3_bucket, s3_key, region=None)` (boto3 `create_deployment` with S3 revision); `run_ssh_deploy(env, region=None)` (EC2 by tag, SSH + script); `run_ecs_deploy(cluster_name, service_name, region=None)` (new task def from SSM, update service).
+6. **Deploy tools** — `run_ansible_deploy(env, ssm_bucket, ansible_dir="ansible", region=None)` (run ansible-playbook in repo’s ansible dir); `run_ssh_deploy(env, region=None)` (EC2 by tag, SSH + script); `run_ecs_deploy(cluster_name, service_name, region=None)` (new task def from SSM, update service).
 7. **Verify** — `http_health_check(url, timeout_seconds=10)` (requests.get, report OK if status 200–299).
 
 Decorate every tool function with `@tool("short description for the LLM")` and give each a clear docstring. All paths used by tools come from `get_repo_root()` / `get_app_root()` so flow can set them before the crew runs.
@@ -367,10 +365,10 @@ Decorate every tool function with `@tool("short description for the LLM")` and g
 1. **Imports** — `from crewai import Agent` and import all tools from `tools` (including run_ssh_deploy, run_ecs_deploy, get_terraform_output).
 2. **Infra Engineer** — Role "Infrastructure Engineer"; goal to run Terraform init/plan/(apply if allowed) for bootstrap, dev, prod; tools = [terraform_init, terraform_plan, terraform_apply, update_backend_from_bootstrap]; verbose=True, allow_delegation=False.
 3. **Build Engineer** — Role "Build Engineer"; goal to build Docker image, push to ECR, update SSM image_tag; tools = [docker_build, ecr_push_and_ssm, read_ssm_parameter].
-4. **Deploy Engineer** — Role "Deployment Engineer"; goal to trigger deployment per DEPLOY_METHOD (codedeploy, ansible, ssh_script, or ecs); tools = [get_terraform_output, trigger_codedeploy, run_ansible_deploy, run_ssh_deploy, run_ecs_deploy, read_ssm_parameter].
+4. **Deploy Engineer** — Role "Deployment Engineer"; goal to trigger deployment per DEPLOY_METHOD (ansible, ssh_script, or ecs); tools = [get_terraform_output, run_ansible_deploy, run_ssh_deploy, run_ecs_deploy, read_ssm_parameter].
 5. **Verifier** — Role "Deployment Verifier"; goal to verify health endpoint and SSM params; tools = [http_health_check, read_ssm_parameter].
 
-Backstories should tell each agent when to use which tool (e.g. apply only if ALLOW_TERRAFORM_APPLY=1; choose codedeploy vs ansible from DEPLOY_METHOD).
+Backstories should tell each agent when to use which tool (e.g. apply only if ALLOW_TERRAFORM_APPLY=1; choose ansible vs ssh_script vs ecs from DEPLOY_METHOD).
 
 ### 7.3 `flow.py`
 
@@ -384,7 +382,7 @@ Backstories should tell each agent when to use which tool (e.g. apply only if AL
 4. **Four tasks** —  
    - **task_infra** — Description: run Terraform for bootstrap, then dev (with backend.hcl, dev.tfvars), then prod (with backend.hcl, prod.tfvars); apply only if ALLOW_TERRAFORM_APPLY=1. Agent = infra_engineer. Expected output: summary of init/plan/(apply) per env.
    - **task_build** — Description: docker_build, read_ssm_parameter for ECR repo name, ecr_push_and_ssm. Agent = build_engineer, context=[task_infra].
-   - **task_deploy** — Description: choose deploy method from DEPLOY_METHOD (codedeploy, ansible, ssh_script, ecs); call the matching tool with correct args (e.g. ssm_bucket from terraform output for Ansible; cluster/service for ECS). Agent = deploy_engineer, context=[task_build].
+   - **task_deploy** — Description: choose deploy method from DEPLOY_METHOD (ansible, ssh_script, ecs); call the matching tool with correct args (e.g. ssm_bucket from terraform output for Ansible; cluster/service for ECS). Agent = deploy_engineer, context=[task_build].
    - **task_verify** — Description: http_health_check(health_url), read SSM image_tag and ecr_repo_name. Agent = verifier_agent, context=[task_deploy].
 5. **Return** — `Crew(agents=[all four], tasks=[all four], process=Process.sequential, verbose=True)`.
 

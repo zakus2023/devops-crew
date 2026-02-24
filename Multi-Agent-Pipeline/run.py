@@ -41,8 +41,8 @@ except ImportError:
 def _sync_deploy_method_to_terraform(repo_root: str, deploy_method: str) -> None:
     """
     Sync .env DEPLOY_METHOD to Terraform enable_ecs in prod and dev tfvars. Runs before the crew.
-    - DEPLOY_METHOD=ecs -> enable_ecs = true (ECS path only; no EC2 ASG, bastion, or CodeDeploy).
-    - Any other method (ssh_script, codedeploy, ansible) -> enable_ecs = false (EC2/CodeDeploy path).
+    - DEPLOY_METHOD=ecs -> enable_ecs = true (ECS path only; no EC2 ASG or bastion).
+    - Any other method (ssh_script, ansible) -> enable_ecs = false (EC2 path).
     The Infra task then runs terraform init/plan/apply for bootstrap, dev, prod (no manual apply needed).
     """
     enable_ecs = deploy_method == "ecs"

@@ -22,6 +22,12 @@ variable "ami_id" {
 
 variable "cloudtrail_bucket" { type = string }
 
+# Create CloudTrail trail. Disable in dev to avoid conflicts (only one env creates trail).
+variable "enable_cloudtrail" {
+  type    = bool
+  default = true
+}
+
 variable "enable_guardduty" {
   type    = bool
   default = true

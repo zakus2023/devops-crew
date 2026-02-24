@@ -2,7 +2,7 @@
 Tools for the Multi-Agent Deploy Pipeline: Terraform, Build, Deploy, Verify.
 
 This module provides the tools that the four pipeline agents (Infra, Build, Deploy, Verifier)
-call to run Terraform, Docker, ECR, SSM, CodeDeploy, Ansible, and health checks. All paths
+call to run Terraform, Docker, ECR, SSM, Ansible, and health checks. All paths
 are relative to repo_root (the deployment project root, e.g. Full-Orchestrator/output).
 flow.py calls set_repo_root() and set_app_root() before creating the crew so tools resolve
 paths correctly.
@@ -10,7 +10,7 @@ paths correctly.
 Tool groups:
   - Terraform: terraform_init, terraform_plan, terraform_apply, update_backend_from_bootstrap (infra agent).
   - Build:     docker_build, ecr_push_and_ssm (build agent).
-  - Deploy:    get_terraform_output, trigger_codedeploy, run_ansible_deploy, run_ssh_deploy, run_ecs_deploy (deploy agent; DEPLOY_METHOD picks one).
+  - Deploy:    get_terraform_output, run_ansible_deploy, run_ssh_deploy, run_ecs_deploy (deploy agent; DEPLOY_METHOD picks one).
   - Shared:    read_ssm_parameter (build, deploy, verifier).
   - Verify:    http_health_check (verifier).
 """
@@ -20,7 +20,9 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
+import zipfile
 from typing import Optional
 
 import requests
@@ -117,8 +119,8 @@ def terraform_init(relative_path: str, backend_config: Optional[str] = None) -> 
     if backend_config:
         cmd.extend(["-backend-config", backend_config, "-reconfigure"])
     try:
-        # Run the terraform init command in work_dir; capture what it prints; wait up to 120 seconds.
-        result = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True, timeout=120)
+        # Run the terraform init command in work_dir; capture what it prints. Allow 300s for S3 backend + provider download.
+        result = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
         # If Terraform exited with code 0 (success), return a short "OK" message.
         if result.returncode == 0:
             return f"terraform init in {relative_path}: OK"
@@ -154,7 +156,7 @@ def terraform_plan(relative_path: str, var_file: Optional[str] = None) -> str:
         cmd.extend(["-var-file", var_file])
     try:
         # Run terraform plan in work_dir; capture output; wait up to 300 seconds.
-        result = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
         # If Terraform succeeded, return OK and the last 2000 characters of output.
         if result.returncode == 0:
             return f"terraform plan in {relative_path}: OK\n{result.stdout[-2000:] if len(result.stdout) > 2000 else result.stdout}"
@@ -193,8 +195,8 @@ def terraform_apply(relative_path: str, var_file: Optional[str] = None) -> str:
     if var_file:
         cmd.extend(["-var-file", var_file])
     try:
-        # Run terraform apply in work_dir; can take a long time, so timeout 600 seconds.
-        result = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True, timeout=600)
+        # Run terraform apply in work_dir. Prod apply (NAT, ALB, ASG, CodeDeploy) can take 8-15 min.
+        result = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=1200)
         # If Terraform succeeded, return OK.
         if result.returncode == 0:
             return f"terraform apply in {relative_path}: OK"
@@ -223,6 +225,8 @@ def update_backend_from_bootstrap() -> str:
     if not os.path.isdir(bootstrap_dir):
         return f"Error: bootstrap directory not found: {bootstrap_dir}"
     # Helper: run terraform output -raw <name> in bootstrap_dir and return the value or None.
+    # Reject Terraform warnings (e.g. "No outputs found") which get written to stdout when
+    # bootstrap hasn't been applied — they would corrupt backend.hcl.
     def _output(name: str) -> Optional[str]:
         try:
             r = subprocess.run(
@@ -230,10 +234,25 @@ def update_backend_from_bootstrap() -> str:
                 cwd=bootstrap_dir,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=10,
             )
-            if r.returncode == 0 and r.stdout and r.stdout.strip():
-                return r.stdout.strip()
+            if r.returncode != 0:
+                return None
+            val = (r.stdout or "").strip()
+            if not val:
+                return None
+            # Reject Terraform warning text or multi-line output (invalid for backend.hcl).
+            if "Warning" in val or "No outputs found" in val or "\n" in val:
+                return None
+            # Reject box-drawing / control chars (Terraform UI artifacts).
+            if any(c in val for c in ("╷", "╵", "│", "\x1b")):
+                return None
+            # Bucket/table names: alphanumeric, hyphens, underscores, dots; reasonable length.
+            if len(val) > 128 or not all(c.isalnum() or c in "-_.%" for c in val):
+                return None
+            return val
         except Exception:
             pass
         return None
@@ -274,6 +293,122 @@ def update_backend_from_bootstrap() -> str:
     return f"update_backend_from_bootstrap: OK. tfstate_bucket={tfstate_bucket}, tflock_table={tflock_table}, cloudtrail_bucket={cloudtrail_bucket}. Updated: {', '.join(updated)}"
 
 
+def _get_scripts_dir() -> str:
+    """Path to Combined-Crew/scripts (sibling of Multi-Agent-Pipeline)."""
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Combined-Crew", "scripts")
+
+
+@tool("Run resolve-aws-limits.py to diagnose VPC/EIP usage and optionally release unassociated EIPs. Call before dev/prod Terraform apply to free quota. Input: region (default us-east-1), release_eips (default True to release unassociated EIPs).")
+def run_resolve_aws_limits(region: str = "us-east-1", release_eips: bool = True) -> str:
+    """
+    Runs resolve-aws-limits.py to free VPC/EIP quota before Terraform apply.
+    Call this before terraform_apply for infra/envs/dev and infra/envs/prod when
+    apply might fail with VpcLimitExceeded or AddressLimitExceeded.
+    """
+    scripts_dir = _get_scripts_dir()
+    script = os.path.join(scripts_dir, "resolve-aws-limits.py")
+    if not os.path.isfile(script):
+        return f"Error: script not found: {script}"
+    cmd = [sys.executable, script, "--region", region]
+    if release_eips:
+        cmd.append("--release-unassociated-eips")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, cwd=scripts_dir)
+        out = (r.stdout or "").strip()
+        err = (r.stderr or "").strip()
+        if r.returncode != 0:
+            return f"resolve-aws-limits FAIL (code {r.returncode})\n{err}\n{out}"
+        return f"resolve-aws-limits OK\n{out}"
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
+
+
+@tool("Run remove-terraform-blockers.py to delete CloudTrail trails that cause conflicts. Call before dev/prod Terraform apply. Input: region (default us-east-1).")
+def run_remove_terraform_blockers(region: str = "us-east-1") -> str:
+    """
+    Runs remove-terraform-blockers.py to delete CloudTrail trails.
+    Call this before terraform_apply for dev/prod when apply might fail with
+    ResourceAlreadyExistsException for CloudTrail.
+    """
+    scripts_dir = _get_scripts_dir()
+    script = os.path.join(scripts_dir, "remove-terraform-blockers.py")
+    if not os.path.isfile(script):
+        return f"Error: script not found: {script}"
+    cmd = [sys.executable, script, "--region", region]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, cwd=scripts_dir)
+        out = (r.stdout or "").strip()
+        err = (r.stderr or "").strip()
+        if r.returncode != 0:
+            return f"remove-terraform-blockers FAIL (code {r.returncode})\n{err}\n{out}"
+        return f"remove-terraform-blockers OK\n{out}"
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {e}"
+
+
+def _parse_tfvars(work_dir: str, var_file: Optional[str]) -> dict:
+    """Parse tfvars file into dict of key=value. Returns {} if file missing or unparseable."""
+    if not var_file:
+        return {}
+    path = os.path.join(work_dir, var_file)
+    if not os.path.isfile(path):
+        return {}
+    out = {}
+    for line in open(path, "r", encoding="utf-8"):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            k, _, v = line.partition("=")
+            out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
+@tool("When terraform apply fails with EntityAlreadyExists for IAM Role: import existing ec2_role and codedeploy_role into state, then retry apply. Input: relative_path (e.g. infra/envs/prod), var_file (e.g. prod.tfvars). Only applies when enable_ecs=false (EC2 path).")
+def run_import_platform_iam_on_conflict(relative_path: str, var_file: Optional[str] = None) -> str:
+    """
+    When terraform apply fails with EntityAlreadyExists for IAM Role, the IAM roles
+    (ec2_role, codedeploy_role) exist in AWS but not in Terraform state. This tool
+    imports them so a retry apply can succeed. Call after apply fails, then retry
+    terraform_apply. Only runs when enable_ecs=false (EC2/ASG path).
+    """
+    root = get_repo_root()
+    work_dir = os.path.join(root, relative_path)
+    if not os.path.isdir(work_dir):
+        return f"Error: directory not found: {work_dir}"
+    vars_d = _parse_tfvars(work_dir, var_file)
+    project = vars_d.get("project", "bluegreen")
+    env = vars_d.get("env") or ("prod" if "prod" in relative_path else "dev")
+    enable_ecs = vars_d.get("enable_ecs", "false").lower() in ("true", "1", "yes")
+    if enable_ecs:
+        return "Skipped: enable_ecs=true (ECS path); ec2_role and codedeploy_role have count=0."
+    ec2_role_name = f"{project}-{env}-ec2-role"
+    codedeploy_role_name = f"{project}-{env}-codedeploy-role"
+    imports = [
+        ("module.platform.aws_iam_role.ec2_role[0]", ec2_role_name),
+        ("module.platform.aws_iam_role.codedeploy_role[0]", codedeploy_role_name),
+    ]
+    results = []
+    for addr, rid in imports:
+        try:
+            r = subprocess.run(
+                ["terraform", "import", addr, rid],
+                cwd=work_dir,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if r.returncode == 0:
+                results.append(f"{addr}: imported OK")
+            else:
+                results.append(f"{addr}: {r.stderr or r.stdout or 'unknown'}")
+        except FileNotFoundError:
+            return "Error: terraform not found in PATH."
+        except Exception as e:
+            results.append(f"{addr}: {type(e).__name__}: {e}")
+    return "import_platform_iam:\n" + "\n".join(results)
+
+
 # ---------------------------------------------------------------------------
 # Build tools (used by Build Engineer agent)
 # ---------------------------------------------------------------------------
@@ -302,6 +437,8 @@ def docker_build(app_relative_path: str = "app", tag: str = "latest") -> str:
             cwd=work_dir,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=300,
         )
         # If build succeeded, return OK and the tag.
@@ -323,7 +460,7 @@ def ecr_push_and_ssm(ecr_repo_name: str, image_tag: str, aws_region: Optional[st
     "Push the image to AWS and tell the system which version to deploy."
     (1) Tags your local image (app:image_tag) with the full ECR address. (2) Logs Docker
     into ECR. (3) Pushes the image to ECR. (4) Writes the image_tag into AWS SSM at
-    /bluegreen/prod/image_tag so CodeDeploy or Ansible know "deploy this version." You
+    /bluegreen/prod/image_tag so Ansible knows "deploy this version." You
     need the ECR repo name (e.g. from read_ssm_parameter("/bluegreen/prod/ecr_repo_name")).
     """
     # Use the region passed in, or from the environment, or default us-east-1.
@@ -341,6 +478,8 @@ def ecr_push_and_ssm(ecr_repo_name: str, image_tag: str, aws_region: Optional[st
             ["docker", "tag", f"app:{image_tag}", ecr_uri],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
         )
         if result.returncode != 0:
@@ -350,6 +489,8 @@ def ecr_push_and_ssm(ecr_repo_name: str, image_tag: str, aws_region: Optional[st
             ["aws", "ecr", "get-login-password", "--region", region],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=60,
         )
         if login.returncode != 0:
@@ -362,6 +503,8 @@ def ecr_push_and_ssm(ecr_repo_name: str, image_tag: str, aws_region: Optional[st
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         out, err = login_cmd.communicate(input=login.stdout, timeout=30)
         if login_cmd.returncode != 0:
@@ -371,6 +514,8 @@ def ecr_push_and_ssm(ecr_repo_name: str, image_tag: str, aws_region: Optional[st
             ["docker", "push", ecr_uri],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=300,
         )
         if push.returncode != 0:
@@ -395,12 +540,11 @@ def ecr_push_and_ssm(ecr_repo_name: str, image_tag: str, aws_region: Optional[st
         return f"Error: {type(e).__name__}: {str(e)}"
 
 
-@tool("Read a Terraform output value. Input: output_name (e.g. artifacts_bucket, codedeploy_app, https_url), relative_path (e.g. infra/envs/prod). Runs 'terraform output -raw <output_name>' in that directory. Use this to get ssm_bucket for run_ansible_deploy or CodeDeploy app/group names.")
+@tool("Read a Terraform output value. Input: output_name (e.g. artifacts_bucket, https_url), relative_path (e.g. infra/envs/prod). Runs 'terraform output -raw <output_name>' in that directory. Use this to get ssm_bucket for run_ansible_deploy.")
 def get_terraform_output(output_name: str, relative_path: str) -> str:
     """
     Read a single Terraform output from a Terraform directory (e.g. infra/envs/prod).
-    Returns the raw value so the Deploy agent can get artifacts_bucket for Ansible or
-    codedeploy_app/codedeploy_group for CodeDeploy without asking the user.
+    Returns the raw value so the Deploy agent can get artifacts_bucket for Ansible without asking the user.
     """
     root = get_repo_root()
     work_dir = os.path.join(root, relative_path)
@@ -412,6 +556,8 @@ def get_terraform_output(output_name: str, relative_path: str) -> str:
             cwd=work_dir,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=45,
         )
         if r.returncode != 0:
@@ -452,7 +598,7 @@ def read_ssm_parameter(name: str, region: Optional[str] = None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Deploy tools (used by Deploy Engineer agent; DEPLOY_METHOD chooses codedeploy or ansible)
+# Deploy tools (used by Deploy Engineer agent; DEPLOY_METHOD chooses ansible, ssh_script, or ecs)
 # ---------------------------------------------------------------------------
 
 @tool("Run Ansible deploy playbook over SSM. Input: env (prod or dev), ssm_bucket (S3 bucket for SSM transfer, e.g. from terraform output artifacts_bucket), ansible_dir relative to repo (default ansible). Runs: ansible-playbook -i inventory/ec2_{env}.aws_ec2.yml playbooks/deploy.yml -e ssm_bucket=... -e env=...")
@@ -528,6 +674,8 @@ def run_ansible_deploy(env: str = "prod", ssm_bucket: str = "", ansible_dir: str
                     aws_cmd,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=15,
                 )
                 if result.returncode == 0 and result.stdout:
@@ -565,6 +713,8 @@ def run_ansible_deploy(env: str = "prod", ssm_bucket: str = "", ansible_dir: str
                 ["wsl", "bash", "-c", cmd_str],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=600,
             )
             out = result.stdout[-1500:] if len(result.stdout) > 1500 else result.stdout
@@ -599,7 +749,7 @@ def run_ansible_deploy(env: str = "prod", ssm_bucket: str = "", ansible_dir: str
                     "Windows had a socket buffer or queue issue calling WSL. Try: 1) Set ANSIBLE_USE_WSL=0 in .env to run Ansible natively (may hit WinError 1 in some shells). "
                     "2) Run the pipeline from inside WSL (cd to Multi-Agent-Pipeline, then python run.py). "
                     "3) Restart WSL: wsl --shutdown, then open WSL again. "
-                    "4) Use another deploy method: set DEPLOY_METHOD=ssh_script (with SSH key and EC2 reachable) or codedeploy/ecs if you have them.\n"
+                    "4) Use another deploy method: set DEPLOY_METHOD=ssh_script (with SSH key and EC2 reachable) or ecs if you have them.\n"
                     f"stderr: {result.stderr}\nstdout: {result.stdout}"
                 )
             return f"Ansible deploy ({env}) via WSL: FAIL\nstderr: {result.stderr}\nstdout: {result.stdout}"
@@ -628,7 +778,7 @@ def run_ansible_deploy(env: str = "prod", ssm_bucket: str = "", ansible_dir: str
         "-e", extra_vars,
     ]
     try:
-        result = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True, timeout=600)
+        result = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600)
         out = result.stdout[-1500:] if len(result.stdout) > 1500 else result.stdout
         if result.returncode == 0:
             if "no hosts matched" in (result.stdout or "").lower() or "skipping: no hosts matched" in (result.stdout or "").lower():
@@ -684,6 +834,8 @@ def run_ssh_deploy(env: str = "prod", region: Optional[str] = None, ssh_user: st
                     cwd=work_dir,
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=15,
                 )
                 if r.returncode == 0 and r.stdout:
@@ -785,7 +937,7 @@ def run_ssh_deploy(env: str = "prod", region: Optional[str] = None, ssh_user: st
             for addr in addrs:
                 cmd = ["ssh"] + ssh_opts + [f"{ssh_user}@{addr}", script]
                 try:
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
                     if result.returncode == 0:
                         out_lines.append(f"{addr}: OK")
                     else:
@@ -863,35 +1015,6 @@ def run_ecs_deploy(cluster_name: str, service_name: str, region: Optional[str] =
         return f"ECS deploy: OK. Service {service_name} updated with {image_uri}; new deployment started."
     except Exception as e:
         return f"ECS deploy error: {type(e).__name__}: {str(e)[:250]}"
-
-
-@tool("Trigger CodeDeploy deployment. Input: application_name (e.g. bluegreen-prod), deployment_group_name (e.g. bluegreen-prod-dg), region optional. Requires s3_bucket and s3_key for revision (e.g. from build output). For simple case, pass bucket and key if you have a deploy bundle.")
-def trigger_codedeploy(application_name: str, deployment_group_name: str, s3_bucket: Optional[str] = None, s3_key: Optional[str] = None, region: Optional[str] = None) -> str:
-    """
-    "Start a CodeDeploy deployment." CodeDeploy needs a zip file in S3 (the
-    "deploy bundle" with appspec.yml and scripts). This tool tells AWS "start a
-    deployment using that zip." You pass the app name, deployment group (from Terraform
-    outputs), and the S3 bucket and key where the zip was uploaded.
-    """
-    # Use the region passed in, or from the environment, or default.
-    region = region or os.environ.get("AWS_REGION", "us-east-1")
-    try:
-        import boto3
-        client = boto3.client("codedeploy", region_name=region)
-        # CodeDeploy needs the revision (the zip in S3); if bucket/key missing, return an error.
-        if s3_bucket and s3_key:
-            revision = {"revisionType": "S3", "s3Location": {"bucket": s3_bucket, "key": s3_key, "bundleType": "zip"}}
-        else:
-            return "Error: s3_bucket and s3_key required for CodeDeploy revision. Build the deploy bundle first and upload to S3."
-        # Tell CodeDeploy to start a new deployment with that revision.
-        resp = client.create_deployment(
-            applicationName=application_name,
-            deploymentGroupName=deployment_group_name,
-            revision=revision,
-        )
-        return f"CodeDeploy deployment started: {resp.get('deploymentId')}"
-    except Exception as e:
-        return f"CodeDeploy error: {type(e).__name__}: {str(e)[:200]}"
 
 
 # ---------------------------------------------------------------------------

@@ -66,3 +66,54 @@ So you get: **from requirements to generated project to (optionally) deployed an
 | **Sibling folders** | Must have Full-Orchestrator and Multi-Agent-Pipeline next to Combined-Crew so imports work. |
 
 For setup and commands, see **README.md**.
+
+---
+
+## Gradio UI — For Absolute Beginners
+
+### What is the Gradio UI?
+
+Instead of running `python run.py requirements.json` from the command line, you can use a **web interface** where you fill in boxes, choose options, and click a button to run the crew.
+
+### What can you do from the UI?
+
+1. **Provide requirements**  
+   Either upload a `requirements.json` file or paste its contents into a text box.
+
+2. **Set run options**  
+   - Where to save the generated project (output directory)  
+   - Production URL (optional, for health checks)  
+   - AWS region  
+
+3. **Choose deploy method**  
+   - **ansible** — Uses Ansible/CodeDeploy  
+   - **ssh_script** — Connects via SSH to EC2 instances  
+   - **ecs** — Updates an ECS service  
+
+4. **For ssh_script: PEM key**  
+   When you pick "ssh_script", you must tell the system how to find your SSH key:
+   - **Upload** — Click "Upload PEM key" and select your `.pem` file  
+   - **Path** — Or type the full path (e.g. `C:/keys/my-ec2-key.pem`)  
+
+   You also need the **AWS key pair name** (the name you gave the key in AWS).
+
+5. **Terraform apply**  
+   A checkbox controls whether Terraform is allowed to apply changes. Unchecked = plan only (safer for testing).
+
+### How do I run the UI?
+
+```bash
+cd Combined-Crew
+pip install -r requirements.txt   # installs Gradio and other deps
+python ui.py
+```
+
+Then open the URL shown (usually `http://127.0.0.1:7860`) in your browser.
+
+### Do I still need .env?
+
+Yes. The UI uses the same `.env` file as the CLI. At minimum, set `OPENAI_API_KEY`. For AWS (Terraform, ECR, deploy), configure your AWS credentials.
+
+### Deploying on Hugging Face
+
+You can host this UI on [Hugging Face Spaces](https://huggingface.co/spaces). See **IMPLEMENTATION.md** for step-by-step deployment instructions. Note: the crew run can take several minutes; free Spaces have time limits, so consider paid hardware or running long jobs locally.

@@ -1,9 +1,9 @@
 {
-  "project": "bluegreen",
+  "project": "myapp",
   "region": "us-east-1",
   "dev": {
-    "domain_name": "dev-app.my-iifb.click",
-    "hosted_zone_id": "Z04241223G31RGIMMIL2C",
+    "domain_name": "dev-app.example.com",
+    "hosted_zone_id": "Z0xxxxxxxxxxxxxx",
     "alarm_email": "dev@example.com",
     "vpc_cidr": "10.20.0.0/16",
     "public_subnets": ["10.20.1.0/24", "10.20.2.0/24"],
@@ -15,8 +15,8 @@
     "ami_id": ""
   },
   "prod": {
-    "domain_name": "app.my-iifb.click",
-    "hosted_zone_id": "Z04241223G31RGIMMIL2C",
+    "domain_name": "app.example.com",
+    "hosted_zone_id": "Z0xxxxxxxxxxxxxx",
     "alarm_email": "ops@example.com",
     "vpc_cidr": "10.30.0.0/16",
     "public_subnets": ["10.30.1.0/24", "10.30.2.0/24"],

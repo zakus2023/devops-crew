@@ -10,3 +10,12 @@ __pycache__/
 Thumbs.db
 # app/ (Node.js)
 app/node_modules/
+
+# Generated output (Terraform state, providers ~800MB, etc.)
+output/
+**/output/
+test-ui/output/
+Full-Orchestrator/output/
+.terraform/
+*.tfstate
+*.tfstate.backup

@@ -114,12 +114,12 @@ resource "aws_codedeploy_deployment_group" "dg" {
     enabled = true
     events  = ["DEPLOYMENT_FAILURE", "DEPLOYMENT_STOP_ON_ALARM", "DEPLOYMENT_STOP_ON_REQUEST"]
   }
+  # Only alb_5xx is used to stop deployments. unhealthy_hosts is not included because it
+  # fires during normal blue/green (e.g. draining or new instances not yet healthy), which
+  # would stop the deployment prematurely.
   alarm_configuration {
     enabled                  = var.enable_deployment_alarms
     ignore_poll_alarm_failure = true
-    alarms                   = var.enable_deployment_alarms ? [
-      aws_cloudwatch_metric_alarm.alb_5xx.alarm_name,
-      aws_cloudwatch_metric_alarm.unhealthy_hosts[0].alarm_name,
-    ] : []
+    alarms                   = var.enable_deployment_alarms ? [aws_cloudwatch_metric_alarm.alb_5xx.alarm_name] : []
   }
 }
