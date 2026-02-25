@@ -545,12 +545,14 @@ def get_terraform_output(output_name: str, relative_path: str) -> str:
     """
     Read a single Terraform output from a Terraform directory (e.g. infra/envs/prod).
     Returns the raw value so the Deploy agent can get artifacts_bucket for Ansible without asking the user.
+    If backend init is required, tries terraform init -backend-config=backend.hcl first (for infra/envs/*).
     """
     root = get_repo_root()
     work_dir = os.path.join(root, relative_path)
     if not os.path.isdir(work_dir):
         return f"Error: directory not found: {work_dir}"
-    try:
+
+    def _run_output() -> tuple[int, str, str]:
         r = subprocess.run(
             ["terraform", "output", "-raw", output_name],
             cwd=work_dir,
@@ -560,13 +562,29 @@ def get_terraform_output(output_name: str, relative_path: str) -> str:
             errors="replace",
             timeout=45,
         )
-        if r.returncode != 0:
-            return f"terraform output {output_name} in {relative_path}: FAIL\nstderr: {r.stderr or r.stdout}"
-        if not (r.stdout and r.stdout.strip()):
+        return r.returncode, r.stdout or "", r.stderr or ""
+
+    try:
+        code, out, err = _run_output()
+        if code != 0 and "Backend initialization required" in err and relative_path.startswith("infra/envs/"):
+            backend_hcl = os.path.join(work_dir, "backend.hcl")
+            if os.path.isfile(backend_hcl):
+                subprocess.run(
+                    ["terraform", "init", "-backend-config", "backend.hcl", "-reconfigure"],
+                    cwd=work_dir,
+                    capture_output=True,
+                    timeout=90,
+                )
+                code, out, err = _run_output()
+        if code != 0:
+            return f"terraform output {output_name} in {relative_path}: FAIL\nstderr: {err or out}"
+        if not (out and out.strip()):
             return f"terraform output {output_name} in {relative_path}: empty value"
-        return f"terraform output {output_name} in {relative_path} = {r.stdout.strip()}"
+        return f"terraform output {output_name} in {relative_path} = {out.strip()}"
     except FileNotFoundError:
         return "Error: terraform not found in PATH."
+    except subprocess.TimeoutExpired:
+        return f"Error: terraform output timed out in {relative_path}"
     except Exception as e:
         return f"Error: {type(e).__name__}: {str(e)}"
 

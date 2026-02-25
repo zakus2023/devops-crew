@@ -134,15 +134,18 @@ def _empty_backend_bucket(bootstrap_work_dir: str, region: str) -> None:
     Dev/prod state files live in this bucket. Emptying it ensures bootstrap destroy
     can reliably delete the bucket (avoids versioning/force_destroy edge cases).
     """
-    out = subprocess.run(
-        ["terraform", "output", "-raw", "tfstate_bucket"],
-        cwd=bootstrap_work_dir,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=10,
-    )
+    try:
+        out = subprocess.run(
+            ["terraform", "output", "-raw", "tfstate_bucket"],
+            cwd=bootstrap_work_dir,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=45,
+        )
+    except subprocess.TimeoutExpired:
+        return
     if out.returncode != 0 or not (bucket := (out.stdout or "").strip()):
         return
     print(f"  emptying backend bucket: {bucket}")
@@ -156,17 +159,20 @@ def _empty_backend_bucket(bootstrap_work_dir: str, region: str) -> None:
 def _force_delete_ecr(work_dir: str, region: str, env: str) -> None:
     """Force-delete ECR repo. Get name from terraform output, or SSM fallback if state has no outputs."""
     ecr_name = None
-    out = subprocess.run(
-        ["terraform", "output", "-raw", "ecr_repo"],
-        cwd=work_dir,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=10,
-    )
-    ecr_name = (out.stdout or "").strip() if out.returncode == 0 else None
-    # Fallback: state may have no outputs (e.g. "Warning: No outputs found"). Try SSM.
+    try:
+        out = subprocess.run(
+            ["terraform", "output", "-raw", "ecr_repo"],
+            cwd=work_dir,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=45,
+        )
+        ecr_name = (out.stdout or "").strip() if out.returncode == 0 else None
+    except subprocess.TimeoutExpired:
+        pass  # fall through to SSM
+    # Fallback: state may have no outputs, timeout, or "Warning: No outputs found". Try SSM.
     if not ecr_name:
         ssm = subprocess.run(
             ["aws", "ssm", "get-parameter", "--name", f"/bluegreen/{env}/ecr_repo_name", "--query", "Parameter.Value", "--output", "text", "--region", region],

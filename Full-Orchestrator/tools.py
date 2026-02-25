@@ -98,7 +98,7 @@ def create_orchestrator_tools(output_dir: str, requirements: Dict[str, Any]) -> 
                 cwd=work_dir,
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=120,
             )
             if init_result.returncode != 0:
                 return (
@@ -111,7 +111,7 @@ def create_orchestrator_tools(output_dir: str, requirements: Dict[str, Any]) -> 
                 cwd=work_dir,
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=60,
             )
             if result.returncode == 0:
                 return f"terraform validate in {relative_path}: OK"
