@@ -69,6 +69,18 @@ def toggle_ssh_fields(method):
     return gr.update(visible=(method == "ssh_script"))
 
 
+def toggle_deploy_method_ansible(method, output_dir):
+    """When ansible: uncheck and disable Terraform apply; show procedure. Otherwise: enable apply, hide procedure."""
+    is_ansible = (method or "").strip().lower() == "ansible"
+    out = (output_dir or "").strip() or "./output"
+    procedure_md = _ansible_procedure_md(out) if is_ansible else ""
+    return (
+        gr.update(value=False, interactive=not is_ansible),  # allow_terraform_apply
+        gr.update(visible=is_ansible),  # ansible_procedure_group
+        procedure_md,  # ansible_procedure_md
+    )
+
+
 def toggle_terraform_confirm(allow_apply):
     """Show Terraform confirmation only when apply is disabled."""
     return gr.update(visible=not allow_apply)
@@ -84,6 +96,48 @@ MSG_TERRAFORM_NO_APPLY_CONFIRM = (
     "**To create infrastructure:** Check \"Allow Terraform apply\" and click Run. "
     "Terraform will apply and create/update bootstrap, dev, and prod resources (VPC, ECR, EC2/ECS, etc.)."
 )
+
+def _ansible_procedure_md(output_dir: str) -> str:
+    """Step-by-step procedure when Ansible deploy method is selected."""
+    out = (output_dir or "").strip() or "./output"
+    return f"""
+**Operating system:** Run these commands on **Linux**, **macOS**, or **Windows (WSL recommended)**.  
+On Windows without WSL, use PowerShell or Git Bash; set `ANSIBLE_USE_WSL=0` in .env if needed.
+
+**Step-by-step procedure** (use the Output directory path above):
+
+1. **Bootstrap**
+   ```bash
+   cd {out}/infra/bootstrap
+   terraform init
+   terraform apply -auto-approve
+   ```
+
+2. **Update backend config** — Copy bootstrap outputs into `infra/envs/dev/backend.hcl`, `infra/envs/prod/backend.hcl`, and tfvars:
+   ```bash
+   terraform output -raw tfstate_bucket
+   terraform output -raw tflock_table
+   terraform output -raw cloudtrail_bucket
+   ```
+
+3. **Dev environment**
+   ```bash
+   cd {out}/infra/envs/dev
+   terraform init -backend-config=backend.hcl -reconfigure
+   terraform apply -auto-approve -var-file=dev.tfvars
+   ```
+
+4. **Prod environment**
+   ```bash
+   cd {out}/infra/envs/prod
+   terraform init -backend-config=backend.hcl -reconfigure
+   terraform apply -auto-approve -var-file=prod.tfvars
+   ```
+
+5. **Then run this UI again** (or the pipeline) — Build, Deploy (Ansible), and Verify will use the applied infra.
+
+See `RUN_ORDER.md` in the output directory for full details.
+"""
 
 
 def _parse_and_apply_env_vars(text: str) -> dict:
@@ -310,9 +364,11 @@ def build_ui():
                     value=_dm,
                     label="Deploy method (ansible | ssh_script | ecs)",
                 )
+                _allow_init = False if _dm == "ansible" else (os.environ.get("ALLOW_TERRAFORM_APPLY", "").strip() == "1")
                 allow_terraform_apply = gr.Checkbox(
                     label="Allow Terraform apply (unchecked = plan only)",
-                    value=os.environ.get("ALLOW_TERRAFORM_APPLY", "").strip() == "1",
+                    value=_allow_init,
+                    interactive=(_dm != "ansible"),
                 )
                 with gr.Group(visible=True) as terraform_confirm_group:
                     confirm_no_apply = gr.Checkbox(
@@ -353,10 +409,28 @@ def build_ui():
                         placeholder="e.g. my-ec2-key",
                     )
 
+                with gr.Group(visible=(_dm == "ansible")) as ansible_procedure_group:
+                    gr.Markdown("**Ansible: run Terraform apply manually** (Terraform apply is disabled)")
+                    _out_init = os.environ.get("OUTPUT_DIR", "").strip() or os.path.join(_THIS_DIR, "output")
+                    ansible_procedure_md = gr.Markdown(
+                        value=_ansible_procedure_md(_out_init),
+                        elem_classes=["ansible-procedure"],
+                    )
+
                 deploy_method.change(
                     toggle_ssh_fields,
                     inputs=[deploy_method],
                     outputs=[ssh_group],
+                )
+                deploy_method.change(
+                    toggle_deploy_method_ansible,
+                    inputs=[deploy_method, output_dir],
+                    outputs=[allow_terraform_apply, ansible_procedure_group, ansible_procedure_md],
+                )
+                output_dir.change(
+                    lambda o: _ansible_procedure_md(o or ""),
+                    inputs=[output_dir],
+                    outputs=[ansible_procedure_md],
                 )
 
             with gr.Column(scale=1):
