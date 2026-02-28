@@ -682,14 +682,14 @@ def build_ui():
                     outputs=[terraform_confirm_group],
                 )
 
-                with gr.Accordion("Environment variables (optional)", open=False):
+                with gr.Accordion("Environment variables (required: OPENAI_API_KEY)", open=True):
                     gr.Markdown(
-                        "Override or supplement the .env file. KEY=value per line. These take precedence over the .env file for this run."
+                        "Provide your own credentials. KEY=value per line. Required: OPENAI_API_KEY. For AWS (Terraform, ECR, deploy): AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY. On Render/Hugging Face, use this section — do not share keys in dashboard."
                     )
                     env_vars = gr.Textbox(
-                        label="Variables (required and optional listed below)",
+                        label="Variables",
                         value=ENV_TEMPLATE,
-                        placeholder="OPENAI_API_KEY=sk-...",
+                        placeholder="OPENAI_API_KEY=sk-...\nAWS_ACCESS_KEY_ID=...\nAWS_SECRET_ACCESS_KEY=...",
                         info="Required: OPENAI_API_KEY. For AWS: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.",
                         lines=28,
                     )

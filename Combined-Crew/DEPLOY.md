@@ -13,7 +13,9 @@ Host the pipeline UI (Generate → Infra → Build → Deploy → Verify) on Ren
 
 ## Credentials (all platforms)
 
-Users provide their own in the UI (Environment variables):
+**Do not share API keys.** Each user provides their own credentials in the app UI.
+
+When running the pipeline, expand **Environment variables** in the UI and enter (one per line, `KEY=value`):
 
 | Variable | Required | Notes |
 |----------|----------|-------|
@@ -21,6 +23,8 @@ Users provide their own in the UI (Environment variables):
 | `AWS_ACCESS_KEY_ID` | No | Terraform, ECR, deploy |
 | `AWS_SECRET_ACCESS_KEY` | No | |
 | `PRE_BUILT_IMAGE_TAG` | No | When Build can't run Docker: tag from GitHub Actions or `ecr_list_image_tags` |
+
+**Render / Hugging Face owner:** Leave dashboard Environment/Settings empty. Do not add your keys there for shared deployments — users supply theirs in the UI.
 
 ---
 
@@ -30,8 +34,7 @@ Users provide their own in the UI (Environment variables):
 
 - [Render](https://render.com) account
 - [GitHub](https://github.com) account
-- OpenAI API key (required for CrewAI)
-- AWS credentials (optional; for Terraform, ECR, deploy)
+- (Users provide their own OpenAI API key and AWS credentials in the app UI)
 
 ---
 
@@ -84,21 +87,11 @@ git push -u origin main
 
 ---
 
-### Step 4: Set environment variables
+### Step 4: Environment (leave empty for shared use)
 
-1. In the Render dashboard, open your **crew-devops** service.
-2. Go to **Environment** (left sidebar).
-3. Add these variables (click **Add Environment Variable**):
+**Leave the Render dashboard Environment empty.** Users provide their own `OPENAI_API_KEY` and AWS credentials in the app UI when they run the pipeline (see Step 6).
 
-| Key | Value | Required |
-|-----|-------|----------|
-| `OPENAI_API_KEY` | `sk-your-openai-key` | Yes |
-| `AWS_ACCESS_KEY_ID` | Your AWS access key | No |
-| `AWS_SECRET_ACCESS_KEY` | Your AWS secret key | No |
-
-**Optional:** `AWS_REGION` (default `us-east-1`), `PRE_BUILT_IMAGE_TAG` (when Build can't run Docker).
-
-4. Click **Save Changes**. Render will redeploy automatically.
+If you are the sole user and prefer to set keys once, you can add them in **Environment** → **Add Environment Variable**. For shared deployments, do not add keys — each user enters theirs in the UI.
 
 ---
 
@@ -113,12 +106,15 @@ git push -u origin main
 ### Step 6: Use the app
 
 1. Open the service URL in your browser.
-2. In the UI:
-   - Upload or paste `requirements.json`
-   - Set output directory (default `./output`), deploy method, and options
-   - Expand **Environment variables** to add any extra keys (e.g. `PRE_BUILT_IMAGE_TAG`)
-   - Click **Run Combined-Crew**
-3. After the pipeline completes, click **Download output** to save the generated zip.
+2. **Expand "Environment variables"** and add your credentials (one per line):
+   ```
+   OPENAI_API_KEY=sk-your-openai-key
+   AWS_ACCESS_KEY_ID=your-access-key
+   AWS_SECRET_ACCESS_KEY=your-secret-key
+   ```
+3. Upload or paste `requirements.json`, set output directory, deploy method, and options.
+4. Click **Run Combined-Crew**.
+5. After the pipeline completes, click **Download output** to save the generated zip.
 
 ---
 
@@ -173,11 +169,12 @@ export HF_MODEL="your-username/crew-devops"
 python Combined-Crew/scripts/upload-space-app.py
 ```
 
-5. **Space variables** (Settings → Variables and secrets):
+5. **Space variables** (Settings → Variables and secrets) — deployment config only (not user credentials):
    - `DEVOPS_CREW_MODEL` = `your-username/crew-devops`
    - `HF_TOKEN` = your token (Read role; required for private model)
+   - Leave `OPENAI_API_KEY` and AWS keys empty — users provide theirs in the app UI.
 
-6. **Use** — open Space URL, run pipeline, download output.
+6. **Use** — open Space URL, expand **Environment variables** in the UI, add your `OPENAI_API_KEY` and AWS keys, then run pipeline and download output.
 
 ### Deployment checklist (after code changes)
 
@@ -216,7 +213,7 @@ When `docker build` fails (HF/Render containers lack Docker socket):
 
 | Issue | Solution |
 |-------|----------|
-| "OPENAI_API_KEY required" | Add in UI Environment variables |
+| "OPENAI_API_KEY required" | Expand **Environment variables** in the UI and add `OPENAI_API_KEY=sk-...` |
 | Build fails (docker not found) | Expected. Use CodeBuild or pre-built image |
 | 401 / Repository Not Found (HF) | Add `HF_TOKEN` in Space Settings; ensure `DEVOPS_CREW_MODEL` matches model repo |
 | Module not found | Ensure Full-Orchestrator, Multi-Agent-Pipeline, infra in model/repo |
