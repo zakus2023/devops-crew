@@ -1,0 +1,24 @@
+# Render Blueprint for DevOps-Crew
+# Deploy: Connect this repo to Render → New → Blueprint → select render.yaml
+# Free tier: plan: free (services sleep after ~15 min inactivity)
+services:
+  - type: web
+    runtime: docker
+    name: crew-devops
+    plan: free
+    # Default: uses repo containing this file
+    # rootDir: .  # Build from repo root (Dockerfile at root)
+    healthCheckPath: /
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false # User enters in Render Dashboard
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: AWS_REGION
+        value: us-east-1
+      - key: CREWAI_DISABLE_TELEMETRY
+        value: "true"
+      - key: OTEL_SDK_DISABLED
+        value: "true"

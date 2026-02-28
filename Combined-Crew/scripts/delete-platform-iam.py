@@ -6,9 +6,9 @@ AWS requires: remove role from instance profile -> delete instance profile -> de
 If EC2 instances use the instance profile, disassociate it first.
 
 Usage:
-  python scripts/delete-platform-iam.py [--region us-east-1] [--project bluegreen] [--env dev] [--env prod]
-  python scripts/delete-platform-iam.py --env dev --env prod   # delete both
-  python scripts/delete-platform-iam.py --dry-run
+  python Combined-Crew/scripts/delete-platform-iam.py [--region us-east-1] [--project bluegreen] [--env dev] [--env prod]
+  python Combined-Crew/scripts/delete-platform-iam.py --env dev --env prod   # delete both
+  python Combined-Crew/scripts/delete-platform-iam.py --dry-run
 """
 import argparse
 import json

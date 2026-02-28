@@ -45,6 +45,19 @@ _REPO_ROOT: Optional[str] = None
 # APP_ROOT: optional path to the app directory for Docker build. When set (e.g. crew-DevOps/app),
 # docker_build runs there instead of repo_root/app. run.py sets this when crew-DevOps/app exists.
 _APP_ROOT: Optional[str] = None
+# PROJECT: SSM parameter prefix. Terraform creates /{project}/{env}/image_tag etc. Default "bluegreen".
+_PROJECT: str = "bluegreen"
+
+
+def _ssm_path(env: str, name: str) -> str:
+    """SSM parameter path matching Terraform: /{project}/{env}/{name}."""
+    return f"/{_PROJECT}/{env}/{name}"
+
+
+def _call_tool(tool_fn, *args, **kwargs):
+    """Call a CrewAI tool's underlying function. Use when one tool must invoke another."""
+    fn = getattr(tool_fn, "func", tool_fn)
+    return fn(*args, **kwargs)
 
 
 def set_repo_root(path: str) -> None:
@@ -70,6 +83,15 @@ def set_app_root(path: Optional[str]) -> None:
     global _APP_ROOT
     # Store the path (or None to mean "use repo_root/app").
     _APP_ROOT = path
+
+
+def set_project(project: str) -> None:
+    """
+    Set the project name for SSM parameter paths. Terraform creates /{project}/{env}/image_tag etc.
+    Must match requirements.json "project" (e.g. bluegreen, crew-devops). Default is bluegreen.
+    """
+    global _PROJECT
+    _PROJECT = (project or "bluegreen").strip() or "bluegreen"
 
 
 def get_repo_root() -> str:
@@ -151,9 +173,11 @@ def terraform_plan(relative_path: str, var_file: Optional[str] = None) -> str:
         return f"Error: directory not found: {work_dir}"
     # Build the command: terraform plan.
     cmd = ["terraform", "plan"]
-    # If the caller passed a var file (e.g. prod.tfvars), add it so Terraform gets variable values.
+    # If the caller passed a var file (e.g. prod.tfvars), resolve to absolute path and add it.
     if var_file:
-        cmd.extend(["-var-file", var_file])
+        var_file_path = os.path.join(work_dir, var_file)
+        if os.path.isfile(var_file_path):
+            cmd.extend(["-var-file", os.path.abspath(var_file_path)])
     try:
         # Run terraform plan in work_dir; capture output; wait up to 300 seconds.
         result = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
@@ -191,9 +215,12 @@ def terraform_apply(relative_path: str, var_file: Optional[str] = None) -> str:
         return f"Error: directory not found: {work_dir}"
     # Build the command: terraform apply -auto-approve (no interactive "yes" prompt).
     cmd = ["terraform", "apply", "-auto-approve"]
-    # If the caller passed a var file, add it to the command.
+    # If the caller passed a var file, resolve to absolute path and verify it exists.
     if var_file:
-        cmd.extend(["-var-file", var_file])
+        var_file_path = os.path.join(work_dir, var_file)
+        if not os.path.isfile(var_file_path):
+            return f"Error: var file not found: {var_file_path} (required for dev/prod apply)"
+        cmd.extend(["-var-file", os.path.abspath(var_file_path)])
     try:
         # Run terraform apply in work_dir. Prod apply (NAT, ALB, ASG, CodeDeploy) can take 8-15 min.
         result = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=1200)
@@ -298,6 +325,87 @@ def _get_scripts_dir() -> str:
     return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Combined-Crew", "scripts")
 
 
+@tool("Run the full infra pipeline automatically: resolve limits, remove blockers, bootstrap init/plan/apply, update backend, dev init/plan/apply, prod init/plan/apply. Handles IAM import retry on conflict. Input: region (default us-east-1). Call this instead of individual terraform steps.")
+def run_full_infra_pipeline(region: str = "us-east-1") -> str:
+    """
+    Runs the complete Terraform pipeline in the correct order. No manual steps needed.
+    1. resolve_aws_limits + remove_terraform_blockers
+    2. bootstrap: init, plan, apply (if ALLOW_TERRAFORM_APPLY=1)
+    3. update_backend_from_bootstrap
+    4. dev: init, plan, apply (if allowed); retry with IAM import on EntityAlreadyExists
+    5. prod: init, plan, apply (if allowed); retry with IAM import on EntityAlreadyExists
+    """
+    allow_apply = os.environ.get("ALLOW_TERRAFORM_APPLY") == "1"
+    lines = []
+
+    def _run(tool_fn, *args, **kwargs):
+        r = _call_tool(tool_fn, *args, **kwargs)
+        lines.append(r)
+        return r
+
+    # 0. Resolve limits and remove blockers
+    _run(run_resolve_aws_limits, region=region, release_eips=True)
+    _run(run_remove_terraform_blockers, region=region)
+
+    # 1. Bootstrap
+    r = _run(terraform_init, "infra/bootstrap")
+    if "FAIL" in r:
+        return "\n".join(lines)
+    _run(terraform_plan, "infra/bootstrap")
+    if allow_apply:
+        r = _run(terraform_apply, "infra/bootstrap")
+        if "FAIL" in r:
+            return "\n".join(lines)
+
+    # 2. Update backend for dev/prod
+    r = _run(update_backend_from_bootstrap)
+    if "Error:" in r:
+        return "\n".join(lines)
+
+    def _apply_env(env: str, var_file: str, max_retries: int = 2) -> str:
+        """Apply env with IAM import retry on conflict, and generic retry on failure (e.g. timeout, partial apply)."""
+        path = f"infra/envs/{env}"
+        for attempt in range(max_retries):
+            _run(run_resolve_aws_limits, region=region, release_eips=True)
+            _run(run_remove_terraform_blockers, region=region)
+            r = _run(terraform_apply, path, var_file)
+            if "FAIL" not in r:
+                return r
+            # Already-exists conflicts: import into state and retry (IAM roles, IAM policy, CloudWatch, CodeDeploy)
+            if any(x in r for x in ("EntityAlreadyExists", "ResourceAlreadyExistsException", "ApplicationAlreadyExistsException", "already exists")):
+                _run(run_import_platform_iam_on_conflict, path, var_file)
+                _run(run_import_existing_platform_resources, path, var_file)
+                r = _run(terraform_apply, path, var_file)
+                if "FAIL" not in r:
+                    return r
+            # Other failure (timeout, partial apply): wait and retry
+            if attempt < max_retries - 1:
+                lines.append(f"{env} apply attempt {attempt + 1} failed; retrying in 30s...")
+                time.sleep(30)
+        return r
+
+    # 3. Dev
+    r = _run(terraform_init, "infra/envs/dev", "backend.hcl")
+    if "FAIL" in r:
+        return "\n".join(lines)
+    _run(terraform_plan, "infra/envs/dev", "dev.tfvars")
+    if allow_apply:
+        _apply_env("dev", "dev.tfvars")
+
+    # 4. Prod (critical for ssh_script/ecs deploy — must complete so prod EC2/ECS exist)
+    r = _run(terraform_init, "infra/envs/prod", "backend.hcl")
+    if "FAIL" in r:
+        return "\n".join(lines)
+    _run(terraform_plan, "infra/envs/prod", "prod.tfvars")
+    prod_apply_ok = True
+    if allow_apply:
+        r = _apply_env("prod", "prod.tfvars", max_retries=3)  # Extra retries for prod (longer apply)
+        prod_apply_ok = "FAIL" not in r
+
+    status = "OK" if prod_apply_ok else "FAIL (prod apply did not complete — Deploy/Verify will fail without prod EC2/ECS)"
+    return f"run_full_infra_pipeline: {status}\n" + "\n".join(lines)
+
+
 @tool("Run resolve-aws-limits.py to diagnose VPC/EIP usage and optionally release unassociated EIPs. Call before dev/prod Terraform apply to free quota. Input: region (default us-east-1), release_eips (default True to release unassociated EIPs).")
 def run_resolve_aws_limits(region: str = "us-east-1", release_eips: bool = True) -> str:
     """
@@ -388,11 +496,18 @@ def run_import_platform_iam_on_conflict(relative_path: str, var_file: Optional[s
         ("module.platform.aws_iam_role.ec2_role[0]", ec2_role_name),
         ("module.platform.aws_iam_role.codedeploy_role[0]", codedeploy_role_name),
     ]
+    # Terraform import needs -var-file to resolve required variables when loading config
+    import_cmd_base = ["terraform", "import"]
+    if var_file:
+        var_path = os.path.abspath(os.path.join(work_dir, var_file))
+        if os.path.isfile(var_path):
+            import_cmd_base.extend(["-var-file", var_path])
     results = []
     for addr, rid in imports:
         try:
+            cmd = import_cmd_base + [addr, rid]
             r = subprocess.run(
-                ["terraform", "import", addr, rid],
+                cmd,
                 cwd=work_dir,
                 capture_output=True,
                 text=True,
@@ -407,6 +522,101 @@ def run_import_platform_iam_on_conflict(relative_path: str, var_file: Optional[s
         except Exception as e:
             results.append(f"{addr}: {type(e).__name__}: {e}")
     return "import_platform_iam:\n" + "\n".join(results)
+
+
+@tool("When terraform apply fails with ResourceAlreadyExistsException: import CloudWatch log groups, IAM policy, CodeDeploy app into state, then retry. Input: relative_path (e.g. infra/envs/prod), var_file (e.g. prod.tfvars).")
+def run_import_existing_platform_resources(relative_path: str, var_file: Optional[str] = None) -> str:
+    """
+    When terraform apply fails with ResourceAlreadyExistsException (CloudWatch Log Group,
+    IAM Policy, CodeDeploy Application), import the existing resources into Terraform state
+    so a retry apply can succeed. Call after apply fails with ResourceAlreadyExistsException.
+    """
+    root = get_repo_root()
+    work_dir = os.path.join(root, relative_path)
+    if not os.path.isdir(work_dir):
+        return f"Error: directory not found: {work_dir}"
+    vars_d = _parse_tfvars(work_dir, var_file)
+    project = vars_d.get("project", "bluegreen")
+    env = vars_d.get("env") or ("prod" if "prod" in relative_path else "dev")
+    enable_ecs = vars_d.get("enable_ecs", "false").lower() in ("true", "1", "yes")
+
+    # Terraform import needs -var-file to resolve required variables when loading config
+    import_cmd_base = ["terraform", "import"]
+    if var_file:
+        var_path = os.path.abspath(os.path.join(work_dir, var_file))
+        if os.path.isfile(var_path):
+            import_cmd_base.extend(["-var-file", var_path])
+    results = []
+    # CloudWatch log groups: docker, system (always); ecs_app (only when enable_ecs=true)
+    log_groups = [
+        ("docker", f"/{project}/{env}/docker"),
+        ("system", f"/{project}/{env}/system"),
+    ]
+    if enable_ecs:
+        log_groups.append(("ecs_app[0]", f"/ecs/{project}-{env}-app"))
+    for name, log_group in log_groups:
+        addr = f"module.platform.aws_cloudwatch_log_group.{name}"
+        try:
+            cmd = import_cmd_base + [addr, log_group]
+            r = subprocess.run(
+                cmd,
+                cwd=work_dir,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if r.returncode == 0:
+                results.append(f"{addr}: imported OK")
+            else:
+                err = (r.stderr or r.stdout or "").strip()
+                if "does not exist" in err or "Cannot import" in err:
+                    results.append(f"{addr}: skip (not found)")
+                elif "already managed" in err:
+                    results.append(f"{addr}: skip (already in state)")
+                else:
+                    results.append(f"{addr}: {err[:200]}")
+        except FileNotFoundError:
+            return "Error: terraform not found in PATH."
+        except Exception as e:
+            results.append(f"{addr}: {type(e).__name__}: {e}")
+
+    # IAM policy and CodeDeploy app (only when enable_ecs=false)
+    if not enable_ecs:
+        policy_name = f"{project}-{env}-codedeploy-autoscaling"
+        app_name = f"{project}-{env}-codedeploy-app"
+        region = vars_d.get("region", "us-east-1")
+        try:
+            import boto3
+            sts = boto3.client("sts", region_name=region)
+            account = sts.get_caller_identity()["Account"]
+            policy_arn = f"arn:aws:iam::{account}:policy/{policy_name}"
+            for addr, rid in [
+                ("module.platform.aws_iam_policy.codedeploy_autoscaling[0]", policy_arn),
+                ("module.platform.aws_codedeploy_app.app[0]", app_name),
+            ]:
+                try:
+                    cmd = import_cmd_base + [addr, rid]
+                    r = subprocess.run(
+                        cmd,
+                        cwd=work_dir,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    if r.returncode == 0:
+                        results.append(f"{addr}: imported OK")
+                    else:
+                        err = (r.stderr or r.stdout or "").strip()
+                        if "does not exist" in err or "Cannot import" in err:
+                            results.append(f"{addr}: skip (not found)")
+                        else:
+                            results.append(f"{addr}: {err[:200]}")
+                except Exception as e:
+                    results.append(f"{addr}: {type(e).__name__}: {e}")
+        except Exception as e:
+            results.append(f"boto3/STS: {type(e).__name__}: {e}")
+
+    return "import_existing_platform_resources:\n" + "\n".join(results)
 
 
 # ---------------------------------------------------------------------------
@@ -528,16 +738,223 @@ def ecr_push_and_ssm(ecr_repo_name: str, image_tag: str, aws_region: Optional[st
                 )
             return f"docker push failed: {stderr}"
         # Write the image tag to SSM so deploy tools know which version to pull.
+        ssm_path = _ssm_path("prod", "image_tag")
         ssm = boto3.client("ssm", region_name=region)
         ssm.put_parameter(
-            Name="/bluegreen/prod/image_tag",
+            Name=ssm_path,
             Value=image_tag,
             Type="String",
             Overwrite=True,
         )
-        return f"ECR push and SSM update OK: {ecr_uri}, /bluegreen/prod/image_tag = {image_tag}"
+        return f"ECR push and SSM update OK: {ecr_uri}, {ssm_path} = {image_tag}"
     except Exception as e:
         return f"Error: {type(e).__name__}: {str(e)}"
+
+
+@tool("Read PRE_BUILT_IMAGE_TAG from environment. Returns the value if set, else empty. Use when docker_build fails to decide whether to call write_ssm_image_tag.")
+def read_pre_built_image_tag() -> str:
+    """Return PRE_BUILT_IMAGE_TAG from env if set (for Hugging Face Space when image was built via GitHub Actions)."""
+    val = (os.environ.get("PRE_BUILT_IMAGE_TAG") or "").strip()
+    if not val or val.lower() in ("unset", "initial"):
+        return "PRE_BUILT_IMAGE_TAG: not set"
+    return f"PRE_BUILT_IMAGE_TAG: {val}"
+
+
+@tool("Write image_tag to SSM when Docker is unavailable (e.g. Hugging Face Space). Use when image was built elsewhere (GitHub Actions, local). Input: image_tag (e.g. abc123def456 or latest), region optional. No Docker required.")
+def write_ssm_image_tag(image_tag: str, region: Optional[str] = None) -> str:
+    """
+    Write the image_tag to SSM at /{project}/prod/image_tag. Use when Docker is not
+    available (e.g. Hugging Face Space) but the image was built and pushed via GitHub
+    Actions or locally. Set PRE_BUILT_IMAGE_TAG in env to provide the tag, or call
+    this tool with the tag from ecr_list_image_tags. Enables deploy to proceed.
+    """
+    tag = (image_tag or "").strip()
+    if not tag:
+        return "Error: image_tag is required."
+    if tag.lower() in ("unset", "initial"):
+        return f"Error: image_tag '{tag}' is invalid; use the actual tag from ECR (e.g. from GitHub Actions GITHUB_SHA)."
+    region = region or os.environ.get("AWS_REGION", "us-east-1")
+    try:
+        import boto3
+        ssm = boto3.client("ssm", region_name=region)
+        ssm_path = _ssm_path("prod", "image_tag")
+        ssm.put_parameter(Name=ssm_path, Value=tag, Type="String", Overwrite=True)
+        return f"SSM updated: {ssm_path} = {tag}. Deploy can now use this image."
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {str(e)[:250]}"
+
+
+@tool("List image tags in an ECR repository. Input: ecr_repo_name (e.g. bluegreen-prod-app), region optional. Use when Docker unavailable to discover tags from GitHub Actions or prior builds.")
+def ecr_list_image_tags(ecr_repo_name: str, region: Optional[str] = None) -> str:
+    """
+    List image tags in the given ECR repository. No Docker required. Use when
+    docker_build fails (e.g. Hugging Face Space) but images exist from GitHub Actions.
+    Returns comma-separated tags; pick the latest and call write_ssm_image_tag.
+    """
+    region = region or os.environ.get("AWS_REGION", "us-east-1")
+    try:
+        import boto3
+        ecr = boto3.client("ecr", region_name=region)
+        resp = ecr.describe_images(repositoryName=ecr_repo_name, maxResults=20)
+        images = resp.get("imageDetails", [])
+        tags = []
+        for img in images:
+            for t in img.get("imageTags", []) or []:
+                tags.append(t)
+        tags = sorted(set(tags), reverse=True)[:10]
+        if not tags:
+            return f"ECR {ecr_repo_name}: no images found. Build and push via GitHub Actions (.github/workflows/build-push.yml) or locally first."
+        return f"ECR {ecr_repo_name} tags: {', '.join(tags)}. Use write_ssm_image_tag with one of these."
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {str(e)[:250]}"
+
+
+def _get_codebuild_log_tail(cb_client, build_id: str, region: str, project: str, max_lines: int = 40) -> str:
+    """Fetch last lines of CodeBuild CloudWatch log for failed builds."""
+    try:
+        resp = cb_client.batch_get_builds(ids=[build_id])
+        builds = resp.get("builds", [])
+        if not builds:
+            return ""
+        logs_info = builds[0].get("logs", {})
+        cw = logs_info.get("cloudWatchLogs", {})
+        group = cw.get("groupName")
+        stream = cw.get("streamName")
+        if not group or not stream:
+            return ""
+        import boto3
+        logs = boto3.client("logs", region_name=region)
+        resp = logs.get_log_events(logGroupName=group, logStreamName=stream, limit=max_lines, startFromHead=False)
+        events = resp.get("events", [])
+        if not events:
+            return ""
+        lines = [e.get("message", "").rstrip() for e in reversed(events)]
+        tail = "\n".join(lines[-max_lines:])
+        return f"Last log lines:\n{tail}\n\n"
+    except Exception:
+        return ""
+
+
+@tool("Build the app via AWS CodeBuild when Docker is unavailable. Zips app, uploads to S3, runs CodeBuild, updates SSM image_tag. Input: ecr_repo_name (e.g. bluegreen-prod-app), app_relative_path (default 'app'), region optional. Requires bootstrap applied (build_source_bucket, codebuild_project outputs).")
+def codebuild_build_and_push(
+    ecr_repo_name: str,
+    app_relative_path: str = "app",
+    region: Optional[str] = None,
+) -> str:
+    """
+    When Docker is unavailable (e.g. Hugging Face Space), build the app using
+    AWS CodeBuild. Zips the app directory, uploads to S3, starts CodeBuild,
+    waits for completion, then updates SSM image_tag. Automatic fallback — no
+    manual steps. Requires bootstrap Terraform applied (build_source_bucket,
+    codebuild_project outputs).
+    """
+    region = region or os.environ.get("AWS_REGION", "us-east-1")
+    root = get_repo_root()
+    app_root = get_app_root()
+    work_dir = app_root if app_root else os.path.join(root, app_relative_path)
+    if not os.path.isdir(work_dir):
+        return f"Error: app directory not found: {work_dir}"
+    dockerfile_path = os.path.join(work_dir, "Dockerfile")
+    if not os.path.isfile(dockerfile_path):
+        return f"Error: Dockerfile not found in {work_dir}. App must contain a Dockerfile for CodeBuild."
+
+    try:
+        import boto3
+        # Get bootstrap outputs
+        bootstrap_dir = os.path.join(root, "infra", "bootstrap")
+        if not os.path.isdir(bootstrap_dir):
+            return "Error: infra/bootstrap not found. Run Generate and Infra steps first."
+        r = subprocess.run(
+            ["terraform", "output", "-raw", "build_source_bucket"],
+            cwd=bootstrap_dir,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if r.returncode != 0:
+            return f"Error: build_source_bucket not found in bootstrap. Run terraform apply in infra/bootstrap first. stderr: {(r.stderr or r.stdout or '')[:200]}"
+        bucket = r.stdout.strip()
+        r = subprocess.run(
+            ["terraform", "output", "-raw", "codebuild_project"],
+            cwd=bootstrap_dir,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if r.returncode != 0:
+            return f"Error: codebuild_project not found in bootstrap. stderr: {(r.stderr or r.stdout or '')[:200]}"
+        project = r.stdout.strip()
+
+        sts = boto3.client("sts", region_name=region)
+        account = sts.get_caller_identity()["Account"]
+        image_tag = f"codebuild-{int(time.time())}"
+
+        # Zip app directory
+        zip_path = os.path.join(tempfile.gettempdir(), f"app-{image_tag}.zip")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for dirpath, _, filenames in os.walk(work_dir):
+                for fn in filenames:
+                    fp = os.path.join(dirpath, fn)
+                    arc = os.path.relpath(fp, work_dir)
+                    zf.write(fp, arc)
+
+        # Upload to S3
+        s3 = boto3.client("s3", region_name=region)
+        s3.upload_file(zip_path, bucket, "app.zip")
+        try:
+            os.remove(zip_path)
+        except OSError:
+            pass
+
+        # Start CodeBuild (with automatic retry on failure)
+        cb = boto3.client("codebuild", region_name=region)
+        env_override = [
+            {"name": "IMAGE_TAG", "value": image_tag, "type": "PLAINTEXT"},
+            {"name": "ECR_REPO", "value": ecr_repo_name, "type": "PLAINTEXT"},
+            {"name": "AWS_ACCOUNT_ID", "value": account, "type": "PLAINTEXT"},
+            {"name": "AWS_REGION", "value": region, "type": "PLAINTEXT"},
+        ]
+        for attempt in range(2):  # Initial try + 1 automatic retry
+            if attempt > 0:
+                # Retry: re-upload zip (in case of S3 sync delay) and new build
+                image_tag = f"codebuild-{int(time.time())}-retry{attempt}"
+                env_override[0] = {"name": "IMAGE_TAG", "value": image_tag, "type": "PLAINTEXT"}
+                zip_path = os.path.join(tempfile.gettempdir(), f"app-{image_tag}.zip")
+                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for dirpath, _, filenames in os.walk(work_dir):
+                        for fn in filenames:
+                            fp = os.path.join(dirpath, fn)
+                            arc = os.path.relpath(fp, work_dir)
+                            zf.write(fp, arc)
+                s3.upload_file(zip_path, bucket, "app.zip")
+                try:
+                    os.remove(zip_path)
+                except OSError:
+                    pass
+                time.sleep(3)  # Brief delay before retry
+            resp = cb.start_build(projectName=project, environmentVariablesOverride=env_override)
+            build_id = resp["build"]["id"]
+            for _ in range(120):
+                resp = cb.batch_get_builds(ids=[build_id])
+                if not resp["builds"]:
+                    break
+                status = resp["builds"][0]["buildStatus"]
+                if status == "SUCCEEDED":
+                    ssm = boto3.client("ssm", region_name=region)
+                    ssm_path = _ssm_path("prod", "image_tag")
+                    ssm.put_parameter(Name=ssm_path, Value=image_tag, Type="String", Overwrite=True)
+                    return f"CodeBuild OK. SSM {ssm_path} = {image_tag}. Deploy can proceed."
+                if status in ("FAILED", "FAULT", "STOPPED", "TIMED_OUT"):
+                    if attempt < 1:
+                        break  # Exit poll loop to retry
+                    time.sleep(2)
+                    log_tail = _get_codebuild_log_tail(cb, build_id, region, project)
+                    return f"CodeBuild FAILED: {status} (after retry).\n{log_tail}Full logs: /aws/codebuild/{project}"
+                time.sleep(5)
+            if attempt >= 1:
+                return "CodeBuild timed out (10 min). Check AWS CodeBuild console."
+    except Exception as e:
+        return f"Error: {type(e).__name__}: {str(e)[:300]}"
 
 
 @tool("Read a Terraform output value. Input: output_name (e.g. artifacts_bucket, https_url), relative_path (e.g. infra/envs/prod). Runs 'terraform output -raw <output_name>' in that directory. Use this to get ssm_bucket for run_ansible_deploy.")
@@ -566,18 +983,38 @@ def get_terraform_output(output_name: str, relative_path: str) -> str:
 
     try:
         code, out, err = _run_output()
-        if code != 0 and "Backend initialization required" in err and relative_path.startswith("infra/envs/"):
+        # If output fails and this is dev/prod, try init with backend.hcl (handles "Backend initialization required" and similar)
+        if code != 0 and relative_path.startswith("infra/envs/"):
             backend_hcl = os.path.join(work_dir, "backend.hcl")
             if os.path.isfile(backend_hcl):
-                subprocess.run(
+                with open(backend_hcl, "r", encoding="utf-8") as f:
+                    backend_content = f.read()
+                # If backend has placeholders, init will fail — give clear guidance
+                if "YOUR_TFSTATE" in backend_content or "YOUR_TFLOCK" in backend_content:
+                    return (
+                        f"terraform output {output_name} in {relative_path}: FAIL — backend.hcl has placeholders (YOUR_TFSTATE_BUCKET, etc.). "
+                        "Run the full infra pipeline with Allow Terraform apply checked so bootstrap applies and update_backend_from_bootstrap fills real values."
+                    )
+                init_r = subprocess.run(
                     ["terraform", "init", "-backend-config", "backend.hcl", "-reconfigure"],
                     cwd=work_dir,
                     capture_output=True,
+                    text=True,
                     timeout=90,
                 )
-                code, out, err = _run_output()
+                if init_r.returncode == 0:
+                    code, out, err = _run_output()
+                else:
+                    init_err = (init_r.stderr or init_r.stdout or "").strip()
+                    err = err or init_err
         if code != 0:
-            return f"terraform output {output_name} in {relative_path}: FAIL\nstderr: {err or out}"
+            err_msg = (err or out or "unknown error").strip()
+            if "backend" in err_msg.lower() or "initialization" in err_msg.lower() or "YOUR_" in err_msg:
+                return (
+                    f"terraform output {output_name} in {relative_path}: FAIL — backend not initialized. "
+                    "Ensure bootstrap was applied and update_backend_from_bootstrap ran. Re-run with Allow Terraform apply."
+                )
+            return f"terraform output {output_name} in {relative_path}: FAIL\nstderr: {err_msg[:500]}"
         if not (out and out.strip()):
             return f"terraform output {output_name} in {relative_path}: empty value"
         return f"terraform output {output_name} in {relative_path} = {out.strip()}"
@@ -613,6 +1050,34 @@ def read_ssm_parameter(name: str, region: Optional[str] = None) -> str:
         return f"SSM {name} = {value}"
     except Exception as e:
         return f"SSM {name} error: {type(e).__name__}: {str(e)[:200]}"
+
+
+@tool("Read SSM /{project}/prod/image_tag. Uses project from set_project (requirements.json). Region optional.")
+def read_ssm_image_tag(region: Optional[str] = None) -> str:
+    """
+    Read the prod image_tag from SSM. Path is /{project}/prod/image_tag where project
+    comes from requirements.json (set by flow). Use this instead of read_ssm_parameter
+    to avoid path construction errors. Returns value or error.
+    """
+    try:
+        path = _ssm_path("prod", "image_tag")
+        return _call_tool(read_ssm_parameter, path, region)
+    except Exception as e:
+        return f"SSM read error: {type(e).__name__}: {str(e)[:300]}"
+
+
+@tool("Read SSM /{project}/prod/ecr_repo_name. Uses project from set_project (requirements.json). Region optional.")
+def read_ssm_ecr_repo_name(region: Optional[str] = None) -> str:
+    """
+    Read the prod ECR repo name from SSM. Path is /{project}/prod/ecr_repo_name where
+    project comes from requirements.json (set by flow). Use this instead of
+    read_ssm_parameter to avoid path construction errors. Returns value or error.
+    """
+    try:
+        path = _ssm_path("prod", "ecr_repo_name")
+        return _call_tool(read_ssm_parameter, path, region)
+    except Exception as e:
+        return f"SSM read error: {type(e).__name__}: {str(e)[:300]}"
 
 
 # ---------------------------------------------------------------------------
@@ -939,18 +1404,20 @@ def run_ssh_deploy(env: str = "prod", region: Optional[str] = None, ssh_user: st
                 proxy_cmd = f'ssh -i {key_arg} -o StrictHostKeyChecking=no -o UserKnownHostsFile={kh} -W %h:%p -p 22 {bastion_user}@{bastion_host}'
                 ssh_opts.extend(["-o", f"ProxyCommand={proxy_cmd}"])
             # Remote script: get image from SSM, ECR login, pull, stop/rm app container, run (sudo for Docker socket access)
+            img_path = _ssm_path(tag_val, "image_tag")
+            repo_path = _ssm_path(tag_val, "ecr_repo_name")
             script = (
                 "set -e; "
                 "export AWS_REGION=%s; "
-                "IMAGE_TAG=$(aws ssm get-parameter --name /bluegreen/%s/image_tag --query Parameter.Value --output text 2>/dev/null || true); "
-                "ECR_REPO=$(aws ssm get-parameter --name /bluegreen/%s/ecr_repo_name --query Parameter.Value --output text 2>/dev/null || true); "
+                "IMAGE_TAG=$(aws ssm get-parameter --name %s --query Parameter.Value --output text 2>/dev/null || true); "
+                "ECR_REPO=$(aws ssm get-parameter --name %s --query Parameter.Value --output text 2>/dev/null || true); "
                 "if [ -z \"$IMAGE_TAG\" ] || [ -z \"$ECR_REPO\" ]; then echo MISSING_SSM; exit 1; fi; "
                 "REGISTRY=$(aws sts get-caller-identity --query Account --output text).dkr.ecr.$AWS_REGION.amazonaws.com; "
                 "aws ecr get-login-password --region $AWS_REGION | sudo docker login --username AWS --password-stdin $REGISTRY; "
                 "sudo docker pull $REGISTRY/$ECR_REPO:$IMAGE_TAG; "
                 "sudo docker stop bluegreen-app 2>/dev/null || true; sudo docker rm -f bluegreen-app 2>/dev/null || true; "
                 "sudo docker run -d --name bluegreen-app -p 8080:8080 --restart unless-stopped $REGISTRY/$ECR_REPO:$IMAGE_TAG"
-            ) % (region, tag_val, tag_val)
+            ) % (region, img_path, repo_path)
             out_lines = []
             for addr in addrs:
                 cmd = ["ssh"] + ssh_opts + [f"{ssh_user}@{addr}", script]
@@ -1001,8 +1468,14 @@ def run_ecs_deploy(cluster_name: str, service_name: str, region: Optional[str] =
         ecs = boto3.client("ecs", region_name=region)
         account = sts.get_caller_identity()["Account"]
         registry = f"{account}.dkr.ecr.{region}.amazonaws.com"
-        image_tag = ssm.get_parameter(Name="/bluegreen/prod/image_tag")["Parameter"]["Value"]
-        ecr_repo = ssm.get_parameter(Name="/bluegreen/prod/ecr_repo_name")["Parameter"]["Value"]
+        image_tag = ssm.get_parameter(Name=_ssm_path("prod", "image_tag"))["Parameter"]["Value"]
+        if not image_tag or str(image_tag).lower() in ("unset", "initial"):
+            return (
+                f"ECS deploy blocked: SSM image_tag is '{image_tag or 'empty'}'. "
+                "Build the image (docker_build + ecr_push_and_ssm) or use write_ssm_image_tag with a tag from ECR. "
+                "On Hugging Face Space: run GitHub Actions build-push.yml first, then set PRE_BUILT_IMAGE_TAG or use ecr_list_image_tags + write_ssm_image_tag."
+            )
+        ecr_repo = ssm.get_parameter(Name=_ssm_path("prod", "ecr_repo_name"))["Parameter"]["Value"]
         image_uri = f"{registry}/{ecr_repo}:{image_tag}"
         # Get current task definition from service
         desc = ecs.describe_services(cluster=cluster_name, services=[service_name])

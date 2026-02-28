@@ -8,9 +8,47 @@ Usage:
 
 Then open the URL shown (default http://127.0.0.1:7860).
 """
+import io
 import json
 import os
+import shutil
 import sys
+import tempfile
+import threading
+import time
+import zipfile
+
+
+class _StreamCapturer:
+    """Captures stdout/stderr to a buffer for live UI display. Thread-safe."""
+
+    def __init__(self, original, label=""):
+        self._original = original
+        self._label = label
+        self._buffer = io.StringIO()
+        self._lock = threading.Lock()
+
+    def write(self, text):
+        if text:
+            with self._lock:
+                self._buffer.write(text)
+            try:
+                self._original.write(text)
+            except Exception:
+                pass
+
+    def flush(self):
+        try:
+            self._original.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        return False  # Web UI, not a real terminal (CrewAI/Rich check this)
+
+    def getvalue(self):
+        with self._lock:
+            return self._buffer.getvalue()
 
 # Disable CrewAI telemetry to avoid "signal only works in main thread" when running in Gradio worker thread
 os.environ.setdefault("CREWAI_DISABLE_TELEMETRY", "true")
@@ -48,6 +86,7 @@ AWS_SECRET_ACCESS_KEY=
 # ALLOW_TERRAFORM_APPLY=1
 # DEPLOY_METHOD=ansible
 # APP_ROOT=
+# PRE_BUILT_IMAGE_TAG=abc123  # When Docker unavailable (HF Space): tag from GitHub Actions or ecr_list_image_tags
 
 # --- SSH / Bastion (for deploy method: ssh_script) ---
 # KEY_NAME=
@@ -75,7 +114,7 @@ def toggle_deploy_method_ansible(method, output_dir):
     out = (output_dir or "").strip() or "./output"
     procedure_md = _ansible_procedure_md(out) if is_ansible else ""
     return (
-        gr.update(value=False, interactive=not is_ansible),  # allow_terraform_apply
+        gr.update(value=not is_ansible, interactive=not is_ansible),  # allow_terraform_apply: True for ssh_script/ecs
         gr.update(visible=is_ansible),  # ansible_procedure_group
         procedure_md,  # ansible_procedure_md
     )
@@ -140,6 +179,73 @@ See `RUN_ORDER.md` in the output directory for full details.
 """
 
 
+def _zip_output_for_download(output_dir: str) -> str | None:
+    """
+    Zip the output directory for download. Excludes large dirs (.terraform, node_modules).
+    Returns path to the zip file, or None if output_dir is invalid.
+    """
+    if not output_dir or not os.path.isdir(output_dir):
+        return None
+    exclude_dirs = {".terraform", "node_modules", "__pycache__"}
+    try:
+        fd, zip_path = tempfile.mkstemp(suffix=".zip")
+        os.close(fd)
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for root, dirs, files in os.walk(output_dir):
+                dirs[:] = [d for d in dirs if d not in exclude_dirs]
+                rel_root = os.path.relpath(root, output_dir)
+                if rel_root == ".":
+                    rel_root = ""
+                for f in files:
+                    path = os.path.join(root, f)
+                    arcname = os.path.join(rel_root, f) if rel_root else f
+                    zf.write(path, arcname)
+        return zip_path
+    except Exception:
+        return None
+
+
+def _delete_output(output_dir: str) -> str:
+    """
+    Delete the output directory from the filesystem (e.g. on Hugging Face Space).
+    Returns a status message. Only deletes paths under the project or cwd.
+    """
+    out = (output_dir or "").strip() or os.path.join(_THIS_DIR, "output")
+    if not os.path.isabs(out):
+        out = os.path.abspath(out)
+    if not os.path.isdir(out):
+        return f"Output directory does not exist or is not a directory: {out}"
+    real_out = os.path.realpath(out)
+    real_this = os.path.realpath(_THIS_DIR)
+    real_cwd = os.path.realpath(os.getcwd())
+    # Safety: only delete if under project dir or cwd
+    if not (
+        real_out == real_this
+        or real_out.startswith(real_this + os.sep)
+        or real_out == real_cwd
+        or real_out.startswith(real_cwd + os.sep)
+    ):
+        return f"Refusing to delete: path is outside the project directory."
+    try:
+        shutil.rmtree(out)
+        return f"Deleted output directory: {out}"
+    except Exception as e:
+        return f"Failed to delete: {e}"
+
+
+def _is_valid_http_url(s: str) -> bool:
+    """True if s looks like an HTTP/HTTPS URL (not a file path)."""
+    s = (s or "").strip()
+    if not s:
+        return False
+    # Windows path (C:\, D:\) or Unix path starting with /
+    if len(s) >= 2 and s[1] == ":" and s[0].isalpha():
+        return False
+    if s.startswith("/") or s.startswith("."):
+        return False
+    return s.startswith("http://") or s.startswith("https://")
+
+
 def _parse_and_apply_env_vars(text: str) -> dict:
     """
     Parse KEY=value lines (like .env) and set os.environ.
@@ -154,11 +260,49 @@ def _parse_and_apply_env_vars(text: str) -> dict:
         if "=" in line:
             key, _, value = line.partition("=")
             key = key.strip()
-            val = value.strip()
-            if key and val:  # Only set non-empty values; skip to avoid clearing .env
+            val = value.strip().strip('"').strip("'")  # Remove surrounding quotes
+            if key and val:
                 prev[key] = os.environ.get(key)
                 os.environ[key] = val
     return prev
+
+
+def _find_app_in_extracted(extract_dir: str) -> str:
+    """Find folder containing Dockerfile, app.py, or server.js (handles flat and nested structure)."""
+    def has_app_files(d: str) -> bool:
+        return (
+            os.path.isfile(os.path.join(d, "Dockerfile"))
+            or os.path.isfile(os.path.join(d, "app.py"))
+            or os.path.isfile(os.path.join(d, "server.js"))
+        )
+    if has_app_files(extract_dir):
+        return extract_dir
+    for name in os.listdir(extract_dir):
+        sub = os.path.join(extract_dir, name)
+        if os.path.isdir(sub) and has_app_files(sub):
+            return sub
+    return extract_dir
+
+
+def _find_output_root(extract_dir: str) -> str:
+    """Find the output root (dir containing infra/) in extracted zip. Handles nested structure."""
+    if os.path.isdir(os.path.join(extract_dir, "infra")):
+        return extract_dir
+    for name in os.listdir(extract_dir):
+        sub = os.path.join(extract_dir, name)
+        if os.path.isdir(sub) and os.path.isdir(os.path.join(sub, "infra")):
+            return sub
+    return extract_dir
+
+
+def _resolve_output_dir(output_dir: str) -> str:
+    """Resolve output_dir to absolute path. On HF Space, relative paths like ./output resolve relative to Combined-Crew."""
+    out = (output_dir or "").strip() or os.path.join(_THIS_DIR, "output")
+    if os.name != "nt" and len(out) >= 2 and out[1] == ":" and out[0].isalpha():
+        out = os.path.join(_THIS_DIR, "output")
+    if not os.path.isabs(out):
+        out = os.path.normpath(os.path.join(_THIS_DIR, out))
+    return os.path.abspath(out)
 
 
 def _resolve_env_path(env_file_path: str, env_file_upload) -> str:
@@ -186,6 +330,7 @@ def run_combined_crew(
     requirements_json,
     output_dir,
     app_dir,
+    app_dir_upload,
     prod_url,
     aws_region,
     deploy_method,
@@ -212,19 +357,22 @@ def run_combined_crew(
     env_prev = _parse_and_apply_env_vars(env_vars or "")
     if not os.environ.get("OPENAI_API_KEY", "").strip():
         _restore_env_vars(env_prev)
-        return (
+        yield (
             "Error: OPENAI_API_KEY is required. Set it in your .env file, upload a .env file, "
             "or add OPENAI_API_KEY=sk-... in the Environment variables section."
-        )
+        ), None
+        return
 
     # Terraform apply confirmation when disabled
     if not allow_terraform_apply and not confirm_no_apply:
         _restore_env_vars(env_prev)
-        return MSG_TERRAFORM_NO_APPLY_CONFIRM
+        yield MSG_TERRAFORM_NO_APPLY_CONFIRM, None
+        return
 
     if not requirements_file and not (requirements_json or "").strip():
         _restore_env_vars(env_prev)
-        return "Error: Provide a requirements.json file or paste JSON in the text box."
+        yield "Error: Provide a requirements.json file or paste JSON in the text box.", None
+        return
     try:
         from run import load_requirements, run_crew
         req_path = getattr(requirements_file, "name", requirements_file) if requirements_file else None
@@ -234,19 +382,75 @@ def run_combined_crew(
             requirements = json.loads(requirements_json.strip())
     except json.JSONDecodeError as e:
         _restore_env_vars(env_prev)
-        return f"Invalid JSON: {e}"
+        yield f"Invalid JSON: {e}", None
+        return
     except Exception as e:
         _restore_env_vars(env_prev)
-        return f"Failed to load requirements: {e}"
+        yield f"Failed to load requirements: {e}", None
+        return
 
     # Priority: UI value, then OUTPUT_DIR from .env, then default
     output_dir = (output_dir or "").strip() or (os.environ.get("OUTPUT_DIR") or "").strip()
     if not output_dir:
         output_dir = os.path.join(_THIS_DIR, "output")
+    # On Linux (e.g. HF Space), Windows paths like C:\... are invalid - use fallback
+    if os.name != "nt" and len(output_dir) >= 2 and output_dir[1] == ":" and output_dir[0].isalpha():
+        output_dir = os.path.join(_THIS_DIR, "output")
+    # App dir: upload (zip) takes precedence over path
     app_dir = (app_dir or "").strip() or None
+    app_extract_dir = None
+    if app_dir_upload:
+        upload_path = getattr(app_dir_upload, "name", app_dir_upload) if app_dir_upload else None
+        if upload_path and os.path.isfile(upload_path) and upload_path.lower().endswith(".zip"):
+            app_extract_dir = tempfile.mkdtemp(prefix="app_upload_")
+            try:
+                with zipfile.ZipFile(upload_path, "r") as zf:
+                    zf.extractall(app_extract_dir)
+                app_dir = _find_app_in_extracted(app_extract_dir)
+                if not os.path.isfile(os.path.join(app_dir, "Dockerfile")):
+                    if app_extract_dir and os.path.isdir(app_extract_dir):
+                        try:
+                            shutil.rmtree(app_extract_dir, ignore_errors=True)
+                        except Exception:
+                            pass
+                    _restore_env_vars(env_prev)
+                    yield "App folder must contain a Dockerfile for build. Upload a zip with Dockerfile.", None
+                    return
+            except Exception as e:
+                if app_extract_dir and os.path.isdir(app_extract_dir):
+                    try:
+                        shutil.rmtree(app_extract_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+                _restore_env_vars(env_prev)
+                yield f"Failed to extract app zip: {e}", None
+                return
+    # Validate app_dir has Dockerfile when provided (path or from upload)
+    if app_dir and os.path.isdir(app_dir) and not os.path.isfile(os.path.join(app_dir, "Dockerfile")):
+        if app_extract_dir and os.path.isdir(app_extract_dir):
+            try:
+                shutil.rmtree(app_extract_dir, ignore_errors=True)
+            except Exception:
+                pass
+        _restore_env_vars(env_prev)
+        yield "App directory must contain a Dockerfile for build.", None
+        return
+    # Reject swapped fields: prod_url must be HTTP(S) URL; app_dir must not be a URL
     prod_url = (prod_url or "").strip()
+    if prod_url and not _is_valid_http_url(prod_url):
+        prod_url = ""  # File path in Production URL field — treat as unset
+    if app_dir and (app_dir.startswith("http://") or app_dir.startswith("https://")):
+        app_dir = None  # URL in Application directory — likely swapped
     aws_region = (aws_region or "").strip() or "us-east-1"
-    deploy_method = (deploy_method or "ansible").strip().lower()
+    # Priority: UI input (deploy method radio) first, then DEPLOY_METHOD from .env
+    deploy_method = (deploy_method or os.environ.get("DEPLOY_METHOD") or "ansible").strip().lower()
+    # Normalize invalid deploy methods (e.g. ecs_script -> ecs; shs_script -> ssh_script)
+    if deploy_method == "ecs_script":
+        deploy_method = "ecs"
+    elif deploy_method == "shs_script":
+        deploy_method = "ssh_script"
+    elif deploy_method not in ("ansible", "ssh_script", "ecs"):
+        deploy_method = "ansible"
 
     ssh_key_path = ""
     ssh_key_content = None
@@ -260,43 +464,110 @@ def run_combined_crew(
                 ssh_key_path = p
             else:
                 _restore_env_vars(env_prev)
-                return f"PEM key file not found: {p}"
+                yield f"PEM key file not found: {p}", None
+                return
 
-    try:
-        success, message = run_crew(
-        requirements=requirements,
-        output_dir=output_dir,
-        prod_url=prod_url,
-        aws_region=aws_region,
-        deploy_method=deploy_method,
-        allow_terraform_apply=bool(allow_terraform_apply),
-        key_name=(key_name or "").strip(),
-        ssh_key_path=ssh_key_path,
-        ssh_key_content=ssh_key_content,
-        app_dir=app_dir,
-    )
-    finally:
-        _restore_env_vars(env_prev)
-    return message
+    result = [None, None]  # [success, message]
+    done = threading.Event()
+    stdout_cap = _StreamCapturer(sys.stdout, "stdout")
+    stderr_cap = _StreamCapturer(sys.stderr, "stderr")
+
+    def _run():
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = stdout_cap, stderr_cap
+        try:
+            success, message = run_crew(
+                requirements=requirements,
+                output_dir=output_dir,
+                prod_url=prod_url,
+                aws_region=aws_region,
+                deploy_method=deploy_method,
+                allow_terraform_apply=bool(allow_terraform_apply),
+                key_name=(key_name or "").strip(),
+                ssh_key_path=ssh_key_path,
+                ssh_key_content=ssh_key_content,
+                app_dir=app_dir,
+            )
+            result[0], result[1] = success, message
+        except Exception as e:
+            import traceback
+            result[0], result[1] = False, f"Error: {e}\n\n{traceback.format_exc()}"
+        finally:
+            sys.stdout, sys.stderr = old_stdout, old_stderr
+            _restore_env_vars(env_prev)
+            if app_extract_dir and os.path.isdir(app_extract_dir):
+                try:
+                    shutil.rmtree(app_extract_dir, ignore_errors=True)
+                except Exception:
+                    pass
+            done.set()
+
+    thread = threading.Thread(target=_run)
+    thread.start()
+
+    # Initial status
+    yield ("Starting pipeline... (live output will stream below)\n", None)
+
+    # Stream live output every 2s (like terminal) and keep connection alive
+    last_len = 0
+    while not done.is_set():
+        time.sleep(2)
+        out = stdout_cap.getvalue() + stderr_cap.getvalue()
+        if out and len(out) != last_len:
+            yield (out, None)
+            last_len = len(out)
+
+    # Final output: console log + result (no duplicate headers)
+    out = stdout_cap.getvalue() + stderr_cap.getvalue()
+    success, message = result[0], result[1]
+    resolved_dir = os.path.abspath(output_dir) if success and output_dir else None
+    final = (out.rstrip() + "\n\n" + message) if out.strip() else message
+    yield final, resolved_dir
 
 
-def run_teardown(env_file_path, env_file_upload, output_dir, aws_region, env_vars):
-    """Tear down all infrastructure (terraform destroy)."""
+def run_teardown(env_file_path, env_file_upload, output_dir, output_upload, aws_region, env_vars):
+    """Tear down all infrastructure (terraform destroy). Uses output_dir or extracts output_upload (zip)."""
     from destroy import run_destroy
     env_path = _resolve_env_path(env_file_path, env_file_upload)
     if load_dotenv and os.path.isfile(env_path):
         load_dotenv(env_path)
     env_prev = _parse_and_apply_env_vars(env_vars or "")
+    extract_dir = None
     try:
-        # Use specified output_dir; fall back to OUTPUT_DIR from .env, then default
-        out_dir = (output_dir or "").strip() or (os.environ.get("OUTPUT_DIR") or "").strip()
-        if not out_dir:
-            out_dir = os.path.join(_THIS_DIR, "output")
+        if output_upload:
+            upload_path = getattr(output_upload, "name", output_upload) if output_upload else None
+            if upload_path and os.path.isfile(upload_path) and str(upload_path).lower().endswith(".zip"):
+                extract_dir = tempfile.mkdtemp(prefix="teardown_output_")
+                try:
+                    with zipfile.ZipFile(upload_path, "r") as zf:
+                        zf.extractall(extract_dir)
+                    out_dir = _find_output_root(extract_dir)
+                    if not os.path.isdir(os.path.join(out_dir, "infra", "bootstrap")):
+                        return f"Invalid output zip: no infra/bootstrap found. Ensure you upload the zip from Download output."
+                except Exception as e:
+                    return f"Failed to extract output zip: {e}"
+            else:
+                out_dir = _resolve_output_dir(output_dir or "")
+        else:
+            out_dir = _resolve_output_dir(output_dir or "")
         region = (aws_region or "").strip() or "us-east-1"
-        success, msg = run_destroy(output_dir=out_dir, aws_region=region, confirm=False)
+        success, msg = run_destroy(
+            output_dir=out_dir,
+            aws_region=region,
+            confirm=False,
+            continue_on_error=True,
+        )
         return msg
+    except Exception as e:
+        import traceback
+        return f"Teardown error: {e}\n\n{traceback.format_exc()}"
     finally:
         _restore_env_vars(env_prev)
+        if extract_dir and os.path.isdir(extract_dir):
+            try:
+                shutil.rmtree(extract_dir, ignore_errors=True)
+            except Exception:
+                pass
 
 
 def build_ui():
@@ -309,6 +580,9 @@ def build_ui():
             """
         )
         gr.Markdown(
+            "**Full run takes 15–20 min.** Keep this tab open. Free Spaces may timeout; upgrade hardware (Settings → Space hardware) if runs are cut off."
+        )
+        gr.Markdown(
             "**If Terraform fails with VpcLimitExceeded/AddressLimitExceeded:** Run `python Combined-Crew/scripts/resolve-aws-limits.py --release-unassociated-eips` and `remove-terraform-blockers.py` from the project root, then re-run. See RUN_ORDER.md §0 in the output directory."
         )
 
@@ -317,7 +591,8 @@ def build_ui():
                 env_file_path = gr.Textbox(
                     label=".env file path",
                     value=os.path.join(_THIS_DIR, ".env"),
-                    placeholder="C:/path/to/.env",
+                    placeholder="/path/to/.env",
+                    info="HF Space: use path like .../snapshots/.../Combined-Crew/.env",
                 )
                 env_file_upload = gr.File(
                     label="Or upload .env file",
@@ -336,37 +611,62 @@ def build_ui():
                 requirements_json = gr.Textbox(
                     label="Or paste JSON here (used if no file uploaded)",
                     placeholder='{"project":"myapp","region":"us-east-1","dev":{...},"prod":{...}}',
+                    info='Example: {"project":"myapp","region":"us-east-1","dev":{"vpc_cidr":"10.0.0.0/16"},"prod":{"vpc_cidr":"10.1.0.0/16"}}',
                     lines=8,
                 )
+                _out_default = os.environ.get("OUTPUT_DIR", "").strip() or os.path.join(_THIS_DIR, "output")
+                # On HF Space (Linux), use ./output to avoid users pasting Windows paths
+                if os.name != "nt" and "/huggingface" in _out_default and "hub" in _out_default:
+                    _out_default = "./output"
                 output_dir = gr.Textbox(
                     label="Output directory (where the project will be generated)",
-                    value=os.environ.get("OUTPUT_DIR", "").strip() or os.path.join(_THIS_DIR, "output"),
+                    value=_out_default,
                     placeholder="./output",
+                    info="HF Space: use ./output or leave default. Avoid Windows paths (C:\\...) on Linux.",
+                )
+                output_upload = gr.File(
+                    label="Or upload output (zip) for teardown — use when output was deleted (e.g. after HF Space restart)",
+                    type="filepath",
+                    file_types=[".zip"],
                 )
                 app_dir = gr.Textbox(
-                    label="Application directory (optional: folder with app to deploy; leave blank to use generated app)",
-                    placeholder="C:/path/to/your-app",
+                    label="Application directory (optional)",
+                    placeholder="/path/to/your-app",
+                    info="Path or upload zip below. Leave blank to use generated app.",
+                )
+                app_dir_upload = gr.File(
+                    label="Or upload app folder (zip) — folder with app.py, Dockerfile, etc.",
+                    type="filepath",
+                    file_types=[".zip"],
                 )
                 prod_url = gr.Textbox(
-                    label="Production URL (optional; verifier prefers Terraform https_url; use domain from requirements, e.g. https://app.my-iifb.click, no www)",
+                    label="Production URL (optional)",
                     value=os.environ.get("PROD_URL", "").strip(),
-                    placeholder="https://app.example.com",
+                    placeholder="https://app.yourdomain.com",
+                    info="Verifier uses Terraform https_url. Use domain from requirements, no www.",
                 )
                 aws_region = gr.Textbox(
                     label="AWS region",
                     value="us-east-1",
                     placeholder="us-east-1",
+                    info="e.g. us-east-1, us-west-2",
                 )
                 _dm = (os.environ.get("DEPLOY_METHOD") or "ansible").strip().lower()
-                _dm = _dm if _dm in ("ansible", "ssh_script", "ecs") else "ansible"
+                # Normalize invalid values (ecs_script->ecs, shs_script->ssh_script)
+                if _dm == "ecs_script":
+                    _dm = "ecs"
+                elif _dm == "shs_script":
+                    _dm = "ssh_script"
+                elif _dm not in ("ansible", "ssh_script", "ecs"):
+                    _dm = "ansible"
                 deploy_method = gr.Radio(
                     choices=["ansible", "ssh_script", "ecs"],
                     value=_dm,
                     label="Deploy method (ansible | ssh_script | ecs)",
                 )
-                _allow_init = False if _dm == "ansible" else (os.environ.get("ALLOW_TERRAFORM_APPLY", "").strip() == "1")
+                _allow_init = False if _dm == "ansible" else True  # Auto-allow Terraform apply for ssh_script/ecs
                 allow_terraform_apply = gr.Checkbox(
-                    label="Allow Terraform apply (unchecked = plan only)",
+                    label="Allow Terraform apply (unchecked = plan only; Build/Deploy/Verify will fail without infra)",
                     value=_allow_init,
                     interactive=(_dm != "ansible"),
                 )
@@ -389,6 +689,8 @@ def build_ui():
                     env_vars = gr.Textbox(
                         label="Variables (required and optional listed below)",
                         value=ENV_TEMPLATE,
+                        placeholder="OPENAI_API_KEY=sk-...",
+                        info="Required: OPENAI_API_KEY. For AWS: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY.",
                         lines=28,
                     )
 
@@ -396,7 +698,8 @@ def build_ui():
                     gr.Markdown("**SSH options** (for deploy method: ssh_script)")
                     pem_path = gr.Textbox(
                         label="Path to PEM key file",
-                        placeholder="C:/path/to/your-key.pem",
+                        placeholder="/path/to/key.pem",
+                        info="Or upload PEM file below.",
                     )
                     pem_file = gr.File(
                         file_types=[".pem"],
@@ -404,9 +707,10 @@ def build_ui():
                         type="filepath",
                     )
                     key_name = gr.Textbox(
-                        label="AWS key pair name (must match EC2 launch key)",
+                        label="AWS key pair name",
                         value=os.environ.get("KEY_NAME", ""),
-                        placeholder="e.g. my-ec2-key",
+                        placeholder="my-ec2-keypair",
+                        info="Must match EC2 launch key.",
                     )
 
                 with gr.Group(visible=(_dm == "ansible")) as ansible_procedure_group:
@@ -443,6 +747,11 @@ def build_ui():
                     max_lines=30,
                     elem_classes=["output-box"],
                 )
+                last_output_dir = gr.State(value=None)
+                gr.Markdown("*After a successful run, download the output as a zip or delete it from the Space.*")
+                with gr.Row():
+                    download_btn = gr.DownloadButton("Download output")
+                    delete_output_btn = gr.Button("Delete output", variant="secondary")
 
         run_btn.click(
             fn=run_combined_crew,
@@ -453,6 +762,7 @@ def build_ui():
                 requirements_json,
                 output_dir,
                 app_dir,
+                app_dir_upload,
                 prod_url,
                 aws_region,
                 deploy_method,
@@ -463,13 +773,33 @@ def build_ui():
                 pem_path,
                 env_vars,
             ],
-            outputs=[output],
+            outputs=[output, last_output_dir],
+        )
+
+        def _create_download(last_dir):
+            path = _zip_output_for_download(last_dir) if last_dir else None
+            return path if path else None
+
+        download_btn.click(
+            fn=_create_download,
+            inputs=[last_output_dir],
+            outputs=[download_btn],
         )
 
         teardown_btn.click(
             fn=run_teardown,
-            inputs=[env_file_path, env_file_upload, output_dir, aws_region, env_vars],
+            inputs=[env_file_path, env_file_upload, output_dir, output_upload, aws_region, env_vars],
             outputs=[output],
+        )
+
+        def _delete_and_report(output_dir_val):
+            msg = _delete_output(output_dir_val)
+            return msg, None  # Clear last_output_dir so Download doesn't use stale path
+
+        delete_output_btn.click(
+            fn=_delete_and_report,
+            inputs=[output_dir],
+            outputs=[output, last_output_dir],
         )
 
         gr.Markdown(
@@ -479,6 +809,7 @@ def build_ui():
             """
         )
 
+    demo.queue(default_concurrency_limit=1)  # One run at a time; streaming keeps connection alive
     return demo
 
 

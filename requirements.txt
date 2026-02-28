@@ -1,0 +1,9 @@
+# Combined-Crew: Full-Orchestrator + Multi-Agent Pipeline
+crewai>=0.80.0
+crewai-tools>=0.14.0
+requests>=2.28.0
+boto3>=1.26.0
+python-dotenv>=1.0.0
+
+# Gradio UI (optional; for ui.py)
+gradio>=4.0.0

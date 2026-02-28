@@ -9,9 +9,9 @@ Terraform fails with VpcLimitExceeded or AddressLimitExceeded when:
 Each dev/prod env creates: 1 VPC, 1 NAT gateway → 1 EIP. So dev+prod need 2 VPCs and 2 EIPs minimum.
 
 Usage:
-  python scripts/resolve-aws-limits.py [--region us-east-1]
-  python scripts/resolve-aws-limits.py --release-unassociated-eips   # release EIPs not attached to anything
-  python scripts/resolve-aws-limits.py --list-vpcs                   # show VPCs (manual deletion required)
+  python Combined-Crew/scripts/resolve-aws-limits.py [--region us-east-1]
+  python Combined-Crew/scripts/resolve-aws-limits.py --release-unassociated-eips   # release EIPs not attached to anything
+  python Combined-Crew/scripts/resolve-aws-limits.py --list-vpcs                   # show VPCs (manual deletion required)
 """
 import argparse
 import json

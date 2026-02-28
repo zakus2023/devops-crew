@@ -1,12 +1,18 @@
 """
-Entry point for Hugging Face Spaces or: gradio app.py
+Sole entry point for Hugging Face Spaces, Render, and local runs.
 
-When deployed on HF Spaces, this file is used as the Gradio app.
-Locally, prefer: python ui.py
+- HF Spaces: Set App file to Combined-Crew/app.py in Space Settings.
+- Render: Uses PORT from env (Render sets it).
+- Locally: python ui.py or gradio app.py
+
+See DEPLOY.md for deployment instructions.
 """
+import os
+
 from ui import build_ui
 
 demo = build_ui()
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    port = int(os.environ.get("PORT", 7860))
+    demo.launch(server_name="0.0.0.0", server_port=port)

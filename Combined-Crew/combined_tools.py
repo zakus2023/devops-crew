@@ -34,5 +34,7 @@ _spec_multi = importlib.util.spec_from_file_location("multi_pipe_tools", os.path
 _mod_multi = importlib.util.module_from_spec(_spec_multi)
 _spec_multi.loader.exec_module(_mod_multi)
 set_repo_root = _mod_multi.set_repo_root
+set_app_root = getattr(_mod_multi, "set_app_root", None)
+set_project = getattr(_mod_multi, "set_project", None)
 
-__all__ = ["create_orchestrator_tools", "set_repo_root"]
+__all__ = ["create_orchestrator_tools", "set_repo_root", "set_app_root", "set_project"]

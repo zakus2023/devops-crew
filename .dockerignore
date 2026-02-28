@@ -1,0 +1,19 @@
+# Exclude from Docker build context
+.git
+.venv
+.env
+__pycache__
+*.pyc
+.pytest_cache
+*.log
+.DS_Store
+output
+**/output
+**/.terraform
+*.tfstate
+*.tfstate.backup
+app/node_modules
+hf-output
+**/hf-output
+*.md
+!README.md

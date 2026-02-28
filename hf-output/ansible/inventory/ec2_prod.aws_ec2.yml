@@ -1,0 +1,12 @@
+# EC2 dynamic inventory for prod. Use: -i inventory/ec2_prod.aws_ec2.yml
+plugin: amazon.aws.aws_ec2
+regions:
+  - us-east-1
+hostnames:
+  - instance-id
+filters:
+  instance-state-name: running
+  tag:Env: prod
+keyed_groups:
+  - key: tags.Env
+    prefix: env

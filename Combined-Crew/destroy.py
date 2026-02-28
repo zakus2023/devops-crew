@@ -49,6 +49,19 @@ def _run(cmd: list, cwd: str, timeout: int = 600) -> tuple[bool, str]:
         return False, str(e)
 
 
+def _extract_lock_id(err: str) -> str | None:
+    """Extract Terraform lock ID from state lock error message."""
+    # Match "ID:        <uuid>" or "ID: <uuid>"
+    m = re.search(r"ID:\s*([a-f0-9-]{36})", err, re.IGNORECASE)
+    return m.group(1) if m else None
+
+
+def _force_unlock(work_dir: str, lock_id: str) -> bool:
+    """Run terraform force-unlock. Returns True on success."""
+    ok, _ = _run(["terraform", "force-unlock", "-force", lock_id], work_dir, timeout=30)
+    return ok
+
+
 def _terraform_init(work_dir: str, backend_config: str | None) -> tuple[bool, str]:
     """Init Terraform in work_dir. Returns (success, error_message)."""
     cmd = ["terraform", "init", "-reconfigure"]
@@ -133,6 +146,7 @@ def _empty_backend_bucket(bootstrap_work_dir: str, region: str) -> None:
 
     Dev/prod state files live in this bucket. Emptying it ensures bootstrap destroy
     can reliably delete the bucket (avoids versioning/force_destroy edge cases).
+    Ignores NoSuchBucket (bucket already deleted manually).
     """
     try:
         out = subprocess.run(
@@ -149,11 +163,34 @@ def _empty_backend_bucket(bootstrap_work_dir: str, region: str) -> None:
     if out.returncode != 0 or not (bucket := (out.stdout or "").strip()):
         return
     print(f"  emptying backend bucket: {bucket}")
-    subprocess.run(
-        ["aws", "s3", "rm", f"s3://{bucket}/", "--recursive", "--region", region],
-        capture_output=True,
-        timeout=120,
-    )
+    try:
+        r = subprocess.run(
+            ["aws", "s3", "rm", f"s3://{bucket}/", "--recursive", "--region", region],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if r.returncode != 0 and "NoSuchBucket" not in (r.stderr or ""):
+            print(f"  (could not empty bucket: {(r.stderr or r.stdout or '')[:150]})")
+    except FileNotFoundError:
+        print("  (aws CLI not found in PATH; skipping bucket empty. Run teardown locally with AWS CLI, or add aws to the Space.)")
+
+
+def _read_project_from_tfvars(work_dir: str, var_file: str) -> str:
+    """Read project from tfvars (e.g. prod.tfvars). Returns 'bluegreen' if not found."""
+    path = os.path.join(work_dir, var_file)
+    if not os.path.isfile(path):
+        return "bluegreen"
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("project") and "=" in line:
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    return val or "bluegreen"
+    except OSError:
+        pass
+    return "bluegreen"
 
 
 def _force_delete_ecr(work_dir: str, region: str, env: str) -> None:
@@ -173,33 +210,51 @@ def _force_delete_ecr(work_dir: str, region: str, env: str) -> None:
     except subprocess.TimeoutExpired:
         pass  # fall through to SSM
     # Fallback: state may have no outputs, timeout, or "Warning: No outputs found". Try SSM.
+    var_file = "prod.tfvars" if env == "prod" else "dev.tfvars"
+    project = _read_project_from_tfvars(work_dir, var_file)
     if not ecr_name:
-        ssm = subprocess.run(
-            ["aws", "ssm", "get-parameter", "--name", f"/bluegreen/{env}/ecr_repo_name", "--query", "Parameter.Value", "--output", "text", "--region", region],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        ecr_name = (ssm.stdout or "").strip() if ssm.returncode == 0 else None
+        try:
+            ssm = subprocess.run(
+                ["aws", "ssm", "get-parameter", "--name", f"/{project}/{env}/ecr_repo_name", "--query", "Parameter.Value", "--output", "text", "--region", region],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            ecr_name = (ssm.stdout or "").strip() if ssm.returncode == 0 else None
+        except FileNotFoundError:
+            pass
     if not ecr_name:
         return
     print(f"  force-deleting ECR repo: {ecr_name}")
-    subprocess.run(
-        ["aws", "ecr", "delete-repository", "--repository-name", ecr_name, "--force", "--region", region],
-        capture_output=True,
-        timeout=30,
-    )
+    try:
+        subprocess.run(
+            ["aws", "ecr", "delete-repository", "--repository-name", ecr_name, "--force", "--region", region],
+            capture_output=True,
+            timeout=30,
+        )
+    except FileNotFoundError:
+        print("  (aws CLI not found; skipping ECR delete)")
 
 
 def run_destroy(
     output_dir: str,
     aws_region: str = "us-east-1",
     confirm: bool = True,
+    only_env: str | None = None,
+    continue_on_error: bool = False,
 ) -> tuple[bool, str]:
     """
     Tear down all infrastructure. Returns (success, message).
     confirm: if False, skips interactive prompt (for UI use).
+    only_env: if "dev" or "prod", destroy only that env (skip others and bootstrap).
+    continue_on_error: if True, try remaining envs even when one fails.
     """
+    fallback = os.path.join(_THIS_DIR, "output")
+    if os.name != "nt" and len(output_dir) >= 2 and output_dir[1] == ":" and output_dir[0].isalpha():
+        output_dir = fallback
+    # Resolve relative paths (e.g. ./output) relative to script dir for HF Space compatibility
+    if not os.path.isabs(output_dir):
+        output_dir = os.path.normpath(os.path.join(_THIS_DIR, output_dir))
     output_dir = os.path.abspath(output_dir)
     lines = []
     if not os.path.isdir(output_dir):
@@ -209,11 +264,16 @@ def run_destroy(
             "Set via: UI textbox, OUTPUT_DIR in .env, or --output-dir when running destroy.py"
         )
 
+    # Always destroy both prod and dev when available (then bootstrap)
     destroy_order = [
         ("infra/envs/prod", "prod.tfvars", "backend.hcl"),
         ("infra/envs/dev", "dev.tfvars", "backend.hcl"),
         ("infra/bootstrap", None, None),
     ]
+    if only_env == "dev":
+        destroy_order = [("infra/envs/dev", "dev.tfvars", "backend.hcl")]
+    elif only_env == "prod":
+        destroy_order = [("infra/envs/prod", "prod.tfvars", "backend.hcl")]
 
     if confirm:
         lines.append(f"Output directory: {output_dir}")
@@ -228,6 +288,7 @@ def run_destroy(
     if err:
         lines.append(f"\nNote: {err}. Dev/prod backend.hcl may point to a non-existent bucket if bootstrap was already destroyed.")
 
+    failed_envs = []
     for relative_path, var_file, backend_config in destroy_order:
         work_dir = os.path.join(output_dir, relative_path)
         if not os.path.isdir(work_dir):
@@ -260,9 +321,26 @@ def run_destroy(
 
         ok, err = _run(cmd, work_dir)
         if not ok:
-            lines.append(f"  destroy failed: {err[:800]}")
-            return False, "\n".join(lines)
+            # Retry on state lock: force-unlock then destroy again
+            if "state lock" in err.lower() or "Error acquiring the state lock" in err:
+                lock_id = _extract_lock_id(err)
+                if lock_id:
+                    lines.append(f"  State lock detected, force-unlocking ({lock_id[:8]}...)...")
+                    if _force_unlock(work_dir, lock_id):
+                        lines.append("  Retrying destroy...")
+                        ok, err = _run(cmd, work_dir)
+            if not ok:
+                env_name = "prod" if "prod" in relative_path else ("dev" if "dev" in relative_path else "bootstrap")
+                failed_envs.append(env_name)
+                lines.append(f"  destroy failed: {err[:800]}")
+                if continue_on_error:
+                    lines.append("  (continuing to next env)")
+                else:
+                    return False, "\n".join(lines)
 
+    if failed_envs:
+        lines.append(f"\nDestroy complete with failures: {', '.join(failed_envs)}")
+        return False, "\n".join(lines)
     lines.append("\nDestroy complete.")
     return True, "\n".join(lines)
 
@@ -271,9 +349,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Tear down Combined-Crew infrastructure (terraform destroy)")
     parser.add_argument("--output-dir", "-o", default=None, help="Output directory (default: OUTPUT_DIR env or ./output)")
     parser.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
+    parser.add_argument("--only", choices=["dev", "prod"], help="Destroy only dev or prod (skip others and bootstrap)")
+    parser.add_argument("--continue-on-error", action="store_true", help="Try remaining envs even when one fails")
     args = parser.parse_args()
     output_dir = (args.output_dir or os.environ.get("OUTPUT_DIR") or "").strip()
     if not output_dir:
+        output_dir = os.path.join(_THIS_DIR, "output")
+    # On Linux (e.g. HF Space), Windows paths like C:\... are invalid - use fallback
+    if os.name != "nt" and len(output_dir) >= 2 and output_dir[1] == ":" and output_dir[0].isalpha():
         output_dir = os.path.join(_THIS_DIR, "output")
     output_dir = os.path.abspath(output_dir)
     region = os.environ.get("AWS_REGION", "us-east-1")
@@ -298,7 +381,13 @@ def main() -> int:
             print("Aborted (no input).")
             return 0
 
-    ok, msg = run_destroy(output_dir, aws_region=region, confirm=False)
+    ok, msg = run_destroy(
+        output_dir,
+        aws_region=region,
+        confirm=False,
+        only_env=args.only,
+        continue_on_error=args.continue_on_error,
+    )
     print(msg)
     return 0 if ok else 1
 

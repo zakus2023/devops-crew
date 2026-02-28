@@ -7,3 +7,6 @@ python-dotenv>=1.0.0
 
 # Gradio UI (optional; for ui.py)
 gradio>=4.0.0
+
+# For Space: load project from model repo
+huggingface_hub>=0.20.0

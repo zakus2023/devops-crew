@@ -8,16 +8,16 @@ Multi-Agent Deploy Pipeline: four specialist agents.
 from crewai import Agent
 
 from tools import (
-    terraform_init,
-    terraform_plan,
-    terraform_apply,
-    update_backend_from_bootstrap,
-    run_resolve_aws_limits,
-    run_remove_terraform_blockers,
-    run_import_platform_iam_on_conflict,
+    run_full_infra_pipeline,
     docker_build,
     ecr_push_and_ssm,
+    codebuild_build_and_push,
+    read_pre_built_image_tag,
+    write_ssm_image_tag,
+    ecr_list_image_tags,
     read_ssm_parameter,
+    read_ssm_image_tag,
+    read_ssm_ecr_repo_name,
     get_terraform_output,
     run_ansible_deploy,
     run_ssh_deploy,
@@ -29,18 +29,18 @@ from tools import (
 
 infra_engineer = Agent(
     role="Infrastructure Engineer",
-    goal="Run Terraform init, plan, and (if allowed) apply for bootstrap, dev, and prod so infrastructure is ready for the app.",
-    backstory="You are a careful infrastructure engineer. Before dev/prod apply, call run_resolve_aws_limits(region, release_eips=True) and run_remove_terraform_blockers(region) to free VPC/EIP quota and remove CloudTrail conflicts. You run terraform init with the correct backend config, then terraform plan, then terraform apply only when ALLOW_TERRAFORM_APPLY=1. After a successful bootstrap apply, call update_backend_from_bootstrap(). If apply fails with VpcLimitExceeded, AddressLimitExceeded, or ResourceAlreadyExistsException, run cleanup and retry. If apply fails with EntityAlreadyExists for IAM Role, call run_import_platform_iam_on_conflict(relative_path, var_file) to import existing ec2_role and codedeploy_role into state, then retry terraform_apply.",
-    tools=[terraform_init, terraform_plan, terraform_apply, update_backend_from_bootstrap, run_resolve_aws_limits, run_remove_terraform_blockers, run_import_platform_iam_on_conflict],
+    goal="Run the full Terraform pipeline so infrastructure is ready for the app.",
+    backstory="You run run_full_infra_pipeline(region) — the only tool you have. It does everything: resolve limits, remove blockers, bootstrap init/plan/apply, update_backend_from_bootstrap, dev init/plan/apply, prod init/plan/apply. Call it with the AWS region (e.g. us-east-1). Report the result.",
+    tools=[run_full_infra_pipeline],
     verbose=True,
     allow_delegation=False,
 )
 
 build_engineer = Agent(
     role="Build Engineer",
-    goal="Build the Docker image for the app, push it to ECR, and update the SSM parameter /bluegreen/prod/image_tag so the deploy step can use the new image.",
-    backstory="You are a CI/CD build engineer. You run docker build for the app directory, then push the image to ECR. Get ECR repo name from read_ssm_parameter('/bluegreen/prod/ecr_repo_name'); if ParameterNotFound, try get_terraform_output('ecr_repo', 'infra/envs/prod'). Update /bluegreen/prod/image_tag so deployment uses the new tag.",
-    tools=[docker_build, ecr_push_and_ssm, read_ssm_parameter, get_terraform_output],
+    goal="Build the Docker image for the app, push it to ECR, and update the SSM parameter image_tag so the deploy step can use the new image.",
+    backstory="You are a CI/CD build engineer. You run docker build for the app directory, then push the image to ECR. Get ECR repo name from read_ssm_ecr_repo_name(region); if ParameterNotFound, try get_terraform_output('ecr_repo', 'infra/envs/prod'). Use ecr_push_and_ssm to push and update image_tag. When Docker is unavailable (e.g. Hugging Face Space): call codebuild_build_and_push(ecr_repo_name, app_relative_path='app', region=...) to build automatically on AWS CodeBuild. If CodeBuild fails or is unavailable, fall back to read_pre_built_image_tag or ecr_list_image_tags; if a tag exists, call write_ssm_image_tag so deploy can proceed.",
+    tools=[docker_build, ecr_push_and_ssm, codebuild_build_and_push, read_pre_built_image_tag, write_ssm_image_tag, ecr_list_image_tags, read_ssm_parameter, read_ssm_ecr_repo_name, get_terraform_output],
     verbose=True,
     allow_delegation=False,
 )
@@ -56,9 +56,9 @@ deploy_engineer = Agent(
 
 verifier_agent = Agent(
     role="Deployment Verifier",
-    goal="Verify that the production HTTPS health endpoint returns 200 and that SSM parameters /bluegreen/prod/image_tag and /bluegreen/prod/ecr_repo_name are set correctly.",
-    backstory="You are a careful DevOps verifier. Prefer the prod URL from get_terraform_output('https_url', 'infra/envs/prod') so it matches Terraform (e.g. https://app.example.com, no www). Fall back to PROD_URL only if Terraform output is unavailable. Then use http_health_check and read_ssm_parameter.",
-    tools=[wait_seconds, http_health_check, read_ssm_parameter, get_terraform_output],
+    goal="Verify that the production HTTPS health endpoint returns 200 and that SSM parameters image_tag and ecr_repo_name are set correctly.",
+    backstory="You are a careful DevOps verifier. Prefer the prod URL from get_terraform_output('https_url', 'infra/envs/prod') so it matches Terraform (e.g. https://app.example.com, no www). Fall back to PROD_URL only if Terraform output is unavailable. Use read_ssm_image_tag(region) and read_ssm_ecr_repo_name(region) for SSM — do NOT use read_ssm_parameter with hand-constructed paths.",
+    tools=[wait_seconds, http_health_check, read_ssm_image_tag, read_ssm_ecr_repo_name, get_terraform_output],
     verbose=True,
     allow_delegation=False,
 )

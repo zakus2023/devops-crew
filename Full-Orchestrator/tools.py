@@ -151,7 +151,10 @@ def create_orchestrator_tools(output_dir: str, requirements: Dict[str, Any]) -> 
     @tool("Write RUN_ORDER.md with the command sequence. Input: optional extra text to append to the run order.")
     def tool_write_run_order(extra_text: Optional[str] = None) -> str:
         """Write RUN_ORDER.md with the command sequence."""
-        return write_run_order(out, extra_text or "")
+        proj = (req.get("project") or "bluegreen")
+        if not isinstance(proj, str):
+            proj = "bluegreen"
+        return write_run_order(out, extra_text or "", project=proj.strip() or "bluegreen")
 
     @tool("Read a file from the output directory. Input: path relative to output dir, e.g. 'infra/bootstrap/main.tf'. Returns file contents or error.")
     def tool_read_file(relative_path: str) -> str:

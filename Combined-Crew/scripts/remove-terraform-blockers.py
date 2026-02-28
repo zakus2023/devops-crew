@@ -8,9 +8,9 @@ Remove AWS resources that block Terraform apply: CloudTrail trails and optionall
   Use --release-eips to release them (after reviewing with --dry-run).
 
 Usage:
-  python scripts/remove-terraform-blockers.py [--region us-east-1] [--project bluegreen]
-  python scripts/remove-terraform-blockers.py --dry-run
-  python scripts/remove-terraform-blockers.py --release-eips   # also release unassociated EIPs
+  python Combined-Crew/scripts/remove-terraform-blockers.py [--region us-east-1] [--project bluegreen]
+  python Combined-Crew/scripts/remove-terraform-blockers.py --dry-run
+  python Combined-Crew/scripts/remove-terraform-blockers.py --release-eips   # also release unassociated EIPs
 """
 import argparse
 import json

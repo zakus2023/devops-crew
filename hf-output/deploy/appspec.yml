@@ -1,0 +1,25 @@
+version: 0.0
+os: linux
+
+files:
+  - source: /
+    destination: /opt/codedeploy-bluegreen
+    overwrite: true
+
+hooks:
+  ApplicationStop:
+    - location: scripts/stop.sh
+      timeout: 300
+      runas: root
+  BeforeInstall:
+    - location: scripts/install.sh
+      timeout: 600
+      runas: root
+  ApplicationStart:
+    - location: scripts/start.sh
+      timeout: 600
+      runas: root
+  ValidateService:
+    - location: scripts/validate.sh
+      timeout: 300
+      runas: root

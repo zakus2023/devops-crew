@@ -7,8 +7,8 @@ from a previous run or manual creation, Terraform apply fails. Run this script b
 re-running Terraform apply to clean them up.
 
 Usage:
-  python scripts/remove-cloudwatch-logs.py [--region us-east-1] [--project bluegreen]
-  python scripts/remove-cloudwatch-logs.py --dry-run   # show what would be deleted
+  python Combined-Crew/scripts/remove-cloudwatch-logs.py [--region us-east-1] [--project bluegreen]
+  python Combined-Crew/scripts/remove-cloudwatch-logs.py --dry-run   # show what would be deleted
 """
 import argparse
 import subprocess

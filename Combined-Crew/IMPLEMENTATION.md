@@ -98,76 +98,9 @@ gradio ui.py
 
 ---
 
-## Deploying on Hugging Face Spaces
+## Deploying (Render / Hugging Face)
 
-### 1. Create a Space
-
-- Go to [huggingface.co/spaces](https://huggingface.co/spaces)
-- Create a new Space
-- Choose **Gradio** as the SDK
-- Choose **Python** and a hardware option (e.g. CPU basic)
-
-### 2. Add files
-
-The Combined-Crew folder already includes **`app.py`**, which HF Spaces can use as the entry point:
-
-```python
-from ui import build_ui
-demo = build_ui()
-```
-
-If you push the whole repo, set the Space to use `Combined-Crew/app.py` as the app file (or configure the Space root accordingly).
-
-**`requirements.txt`** (in the Space repo):
-
-```
-crewai>=0.80.0
-crewai-tools>=0.14.0
-requests>=2.28.0
-boto3>=1.26.0
-python-dotenv>=1.0.0
-gradio>=4.0.0
-```
-
-Copy from Combined-Crew:
-
-- `ui.py`
-- `run.py`
-- `flow.py`
-- `agents.py`
-- `combined_tools.py`
-- `requirements.json` (as a default)
-- The sibling folders **Full-Orchestrator** and **Multi-Agent-Pipeline** (or adjust paths if you flatten the layout)
-
-### 3. Hugging Face layout
-
-For Spaces, the simplest layout is to have everything under one repo. Two options:
-
-**Option A: Monorepo**
-
-- Push the whole `crew-DevOps` repo as the Space
-- Set the Space app file to `Combined-Crew/app.py` or configure the root so `app.py` imports from `Combined-Crew/ui.py`
-
-**Option B: Flatten**
-
-- Copy only Combined-Crew, Full-Orchestrator, and Multi-Agent-Pipeline into the Space
-- Ensure directory structure matches what `run.py` and `agents.py` expect (sibling folders)
-
-### 4. Space Secrets
-
-In **Settings → Repository secrets**, add:
-
-- `OPENAI_API_KEY` — required for CrewAI
-- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (if using AWS)
-
-### 5. Important HF considerations
-
-| Topic | Notes |
-|-------|------|
-| **Timeout** | Free Spaces typically time out after ~60 seconds. `crew.kickoff()` can run much longer. Consider upgrading hardware or running long jobs externally. |
-| **Ephemeral disk** | Generated output may be lost on restart. Plan for streaming results or external storage. |
-| **Security** | A public Space can trigger Terraform/SSH/deploys. Consider a **Private** Space for real use. |
-| **PEM keys** | Uploading PEMs in a shared Space is risky. Prefer private Spaces or a self-hosted deployment. |
+For full instructions, see **[DEPLOY.md](DEPLOY.md)**.
 
 ---
 

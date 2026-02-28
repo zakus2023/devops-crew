@@ -24,6 +24,11 @@ def _write(path: str, content: str, output_dir: str) -> None:
         f.write(content)
 
 
+def _bash_var(name: str) -> str:
+    """Return ${name} for bash scripts; avoids f-string interpreting {name} as Python."""
+    return "$" + chr(123) + name + chr(125)
+
+
 def _get(req: Dict[str, Any], *keys: str, default: Any = "") -> Any:
     """Safely get a nested value from requirements, e.g. _get(req, 'dev', 'domain_name') -> dev.domain_name or default."""
     d = req
@@ -148,6 +153,114 @@ resource "aws_s3_bucket_policy" "cloudtrail" {{
     ]
   }})
 }}
+
+# Build source bucket for CodeBuild (when Docker unavailable, e.g. Hugging Face Space)
+resource "aws_s3_bucket" "build_source" {{
+  bucket_prefix = "${{var.project}}-build-source-"
+  force_destroy = true
+}}
+
+resource "aws_s3_bucket_public_access_block" "build_source" {{
+  bucket                  = aws_s3_bucket.build_source.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}}
+
+# CodeBuild IAM role
+resource "aws_iam_role" "codebuild" {{
+  name = "${{var.project}}-codebuild"
+  assume_role_policy = jsonencode({{
+    Version = "2012-10-17"
+    Statement = [{{
+      Effect = "Allow"
+      Principal = {{ Service = "codebuild.amazonaws.com" }}
+      Action = "sts:AssumeRole"
+    }}]
+  }})
+}}
+
+resource "aws_iam_role_policy" "codebuild" {{
+  role = aws_iam_role.codebuild.name
+  policy = jsonencode({{
+    Version = "2012-10-17"
+    Statement = [
+      {{
+        Effect = "Allow"
+        Action = ["s3:GetObject", "s3:PutObject"]
+        Resource = "arn:aws:s3:::${{aws_s3_bucket.build_source.bucket}}/*"
+      }},
+      {{
+        Effect = "Allow"
+        Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = "arn:aws:logs:*:*:log-group:/aws/codebuild/${{var.project}}-app-build"
+      }},
+      {{
+        Effect = "Allow"
+        Action = ["ecr:GetAuthorizationToken"]
+        Resource = "*"
+      }},
+      {{
+        Effect = "Allow"
+        Action = ["ecr:BatchCheckLayerAvailability", "ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage", "ecr:PutImage", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload"]
+        Resource = "arn:aws:ecr:*:${{data.aws_caller_identity.current.account_id}}:repository/*"
+      }}
+    ]
+  }})
+}}
+
+resource "aws_codebuild_project" "app" {{
+  name          = "${{var.project}}-app-build"
+  service_role  = aws_iam_role.codebuild.arn
+  build_timeout = 600
+
+  artifacts {{
+    type = "NO_ARTIFACTS"
+  }}
+
+  environment {{
+    compute_type    = "BUILD_GENERAL1_SMALL"
+    image           = "aws/codebuild/amazonlinux2-x86_64-standard:5.0"
+    type            = "LINUX_CONTAINER"
+    privileged_mode = true
+  }}
+
+  source {{
+    type      = "S3"
+    location  = "${{aws_s3_bucket.build_source.bucket}}/app.zip"
+    buildspec = <<-BUILDSPEC
+      version: 0.2
+      phases:
+        pre_build:
+          commands:
+            - cd $$CODEBUILD_SRC_DIR
+            - pwd
+            - ls -la
+            - echo "Logging in to ECR..."
+            - aws ecr get-login-password --region $$AWS_REGION | docker login --username AWS --password-stdin $$AWS_ACCOUNT_ID.dkr.ecr.$$AWS_REGION.amazonaws.com
+            - echo "Unzipping app source..."
+            - test -f app.zip || (echo "ERROR: app.zip not found"; ls -la; exit 1)
+            - unzip -o app.zip -d .
+            - echo "After unzip:"
+            - ls -la
+            - test -f Dockerfile || (echo "ERROR: Dockerfile not found after unzip"; exit 1)
+        build:
+          commands:
+            - echo "Building Docker image..."
+            - docker build -t app:$$IMAGE_TAG .
+            - docker tag app:$$IMAGE_TAG $$AWS_ACCOUNT_ID.dkr.ecr.$$AWS_REGION.amazonaws.com/$$ECR_REPO:$$IMAGE_TAG
+            - docker push $$AWS_ACCOUNT_ID.dkr.ecr.$$AWS_REGION.amazonaws.com/$$ECR_REPO:$$IMAGE_TAG
+      BUILDSPEC
+  }}
+
+  logs_config {{
+    cloudwatch_logs {{
+      group_name  = "/aws/codebuild/${{var.project}}-app-build"
+      stream_name = "build"
+    }}
+  }}
+}}
 ''', output_dir)
     # outputs.tf: values needed by envs (backend bucket, lock table, KMS ARN, cloudtrail bucket).
     _write("infra/bootstrap/outputs.tf", '''output "tfstate_bucket" {
@@ -164,6 +277,14 @@ output "tfstate_kms" {
 
 output "cloudtrail_bucket" {
   value = aws_s3_bucket.cloudtrail.bucket
+}
+
+output "build_source_bucket" {
+  value = aws_s3_bucket.build_source.bucket
+}
+
+output "codebuild_project" {
+  value = aws_codebuild_project.app.name
 }
 ''', output_dir)
     return f"Bootstrap Terraform written to {output_dir}/infra/bootstrap (variables.tf, main.tf, outputs.tf)"
@@ -646,14 +767,14 @@ docker stop bluegreen-app 2>/dev/null || true
 docker rm bluegreen-app 2>/dev/null || true
 ''', output_dir)
     # start.sh: read image_tag and ecr_repo_name from SSM, pull image, run container on 8080.
-    _write("deploy/scripts/start.sh", '''#!/usr/bin/env bash
+    _write("deploy/scripts/start.sh", f'''#!/usr/bin/env bash
 set -euo pipefail
 REGION=$(aws configure get region || echo us-east-1)
-IMAGE_TAG=$(aws ssm get-parameter --name "/bluegreen/prod/image_tag" --query "Parameter.Value" --output text 2>/dev/null || echo "latest")
-ECR_REPO=$(aws ssm get-parameter --name "/bluegreen/prod/ecr_repo_name" --query "Parameter.Value" --output text 2>/dev/null || echo "bluegreen-prod-app")
+IMAGE_TAG=$(aws ssm get-parameter --name "/{project}/prod/image_tag" --query "Parameter.Value" --output text 2>/dev/null || echo "latest")
+ECR_REPO=$(aws ssm get-parameter --name "/{project}/prod/ecr_repo_name" --query "Parameter.Value" --output text 2>/dev/null || echo "{project}-prod-app")
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-docker pull ${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}
-docker run -d --name bluegreen-app -p 8080:8080 --restart unless-stopped ${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}
+docker pull ''' + _bash_var("ACCOUNT") + f'''.dkr.ecr.''' + _bash_var("REGION") + f'''.amazonaws.com/''' + _bash_var("ECR_REPO") + f''':''' + _bash_var("IMAGE_TAG") + '''
+docker run -d --name bluegreen-app -p 8080:8080 --restart unless-stopped ''' + _bash_var("ACCOUNT") + f'''.dkr.ecr.''' + _bash_var("REGION") + f'''.amazonaws.com/''' + _bash_var("ECR_REPO") + f''':''' + _bash_var("IMAGE_TAG") + '''
 ''', output_dir)
     # validate.sh: curl localhost:8080/health; exit 1 if unhealthy (CodeDeploy marks deployment failed).
     _write("deploy/scripts/validate.sh", '''#!/usr/bin/env bash
@@ -695,7 +816,7 @@ keyed_groups:
   - key: tags.Env
     prefix: env
 ''', output_dir)
-    _write("ansible/playbooks/deploy.yml", '''---
+    _write("ansible/playbooks/deploy.yml", f'''---
 # Deploy app to EC2 via SSM (no SSH). Use with pipeline DEPLOY_METHOD=ansible.
 # From repo root: ansible-playbook -i ansible/inventory/ec2_prod.aws_ec2.yml ansible/playbooks/deploy.yml -e ssm_bucket=BUCKET -e env=prod
 # Get bucket: terraform output -raw artifacts_bucket (from infra/envs/prod or dev)
@@ -705,9 +826,9 @@ keyed_groups:
   connection: community.aws.aws_ssm
   become: true
   vars:
-    deploy_env: "{{ env | default('dev') }}"
-    ansible_aws_ssm_bucket_name: "{{ ssm_bucket }}"
-    ansible_aws_ssm_region: "{{ ssm_region | default('us-east-1') }}"
+    deploy_env: "{{{{ env | default('dev') }}}}"
+    ansible_aws_ssm_bucket_name: "{{{{ ssm_bucket }}}}"
+    ansible_aws_ssm_region: "{{{{ ssm_region | default('us-east-1') }}}}"
   tasks:
     - name: Require ssm_bucket
       ansible.builtin.assert:
@@ -723,14 +844,14 @@ keyed_groups:
     - name: Deploy (pull image, run container)
       ansible.builtin.shell: |
         set -e
-        ENV=$(cat /opt/bluegreen-env 2>/dev/null || echo "{{ deploy_env }}")
-        REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null || echo "{{ ssm_region | default('us-east-1') }}")
+        ENV=$(cat /opt/bluegreen-env 2>/dev/null || echo "{{{{ deploy_env }}}}")
+        REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null || echo "{{{{ ssm_region | default('us-east-1') }}}}")
         ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-        ECR_REPO=$(aws ssm get-parameter --name "/bluegreen/${ENV}/ecr_repo_name" --region "$REGION" --query Parameter.Value --output text)
-        IMAGE_TAG=$(aws ssm get-parameter --name "/bluegreen/${ENV}/image_tag" --region "$REGION" --query Parameter.Value --output text)
-        [[ -z "$IMAGE_TAG" || "$IMAGE_TAG" == "unset" || "$IMAGE_TAG" == "initial" ]] && { echo "ERROR: /bluegreen/${ENV}/image_tag not set"; exit 1; }
-        ECR_URI="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}"
-        aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
+        ECR_REPO=$(aws ssm get-parameter --name "/{project}/${{ENV}}/ecr_repo_name" --region "$REGION" --query Parameter.Value --output text)
+        IMAGE_TAG=$(aws ssm get-parameter --name "/{project}/${{ENV}}/image_tag" --region "$REGION" --query Parameter.Value --output text)
+        [[ -z "$IMAGE_TAG" || "$IMAGE_TAG" == "unset" || "$IMAGE_TAG" == "initial" ]] && {{ echo "ERROR: /{project}/${{ENV}}/image_tag not set"; exit 1; }}
+        ECR_URI="''' + _bash_var("ACCOUNT_ID") + '''.dkr.ecr.''' + _bash_var("REGION") + '''.amazonaws.com/''' + _bash_var("ECR_REPO") + ''':''' + _bash_var("IMAGE_TAG") + '''"
+        aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "''' + _bash_var("ACCOUNT_ID") + '''.dkr.ecr.''' + _bash_var("REGION") + '''.amazonaws.com"
         docker pull "$ECR_URI"
         docker run -d --name bluegreen-app -p 8080:8080 -e APP_VERSION="$IMAGE_TAG" --restart unless-stopped "$ECR_URI"
       args:
@@ -747,6 +868,7 @@ keyed_groups:
 
 def generate_workflows(requirements: Dict[str, Any], output_dir: str) -> str:
     """Generate GitHub Actions workflows (terraform-plan on PR, build-push on push to app/)."""
+    project = _get(requirements, "project") or "bluegreen"
     # terraform-plan.yml: on PR to main touching infra/, assume AWS role, init+plan prod.
     _write(".github/workflows/terraform-plan.yml", '''name: Terraform Plan
 on:
@@ -770,6 +892,7 @@ jobs:
           terraform plan -var-file=prod.tfvars
 ''', output_dir)
     # build-push.yml: on push to main touching app/, assume AWS role, get ECR repo from SSM, build/tag/push, update image_tag in SSM.
+    # Use regular string (not f-string) so ${{ }} and ${VAR} stay literal for GitHub Actions and bash.
     _write(".github/workflows/build-push.yml", '''name: Build and Push Image
 on:
   push:
@@ -790,7 +913,7 @@ jobs:
       - name: Get ECR repo
         id: ssm
         run: |
-          ECR_REPO=$(aws ssm get-parameter --name "/bluegreen/prod/ecr_repo_name" --query "Parameter.Value" --output text)
+          ECR_REPO=$(aws ssm get-parameter --name "/''' + project + '''/prod/ecr_repo_name" --query "Parameter.Value" --output text)
           echo "ecr_repo_name=$ECR_REPO" >> $GITHUB_OUTPUT
       - uses: aws-actions/amazon-ecr-login@v2
       - name: Build and push
@@ -804,12 +927,12 @@ jobs:
           docker build -t "${ECR_REPO_NAME}:${TAG}" app
           docker tag "${ECR_REPO_NAME}:${TAG}" "${ECR_URI}:${TAG}"
           docker push "${ECR_URI}:${TAG}"
-          aws ssm put-parameter --name "/bluegreen/prod/image_tag" --value "$TAG" --type String --overwrite --region $AWS_REGION
+          aws ssm put-parameter --name "/''' + project + '''/prod/image_tag" --value "$TAG" --type String --overwrite --region $AWS_REGION
 ''', output_dir)
     return f"GitHub Actions workflows written to {output_dir}/.github/workflows/"
 
 
-def write_run_order(output_dir: str, run_order_text: str) -> str:
+def write_run_order(output_dir: str, run_order_text: str, project: str = "bluegreen") -> str:
     """Write RUN_ORDER.md with the sequence of commands to run after generation. run_order_text is appended (e.g. agent summary)."""
     content = f"""# Run order (generated by Full-Orchestrator)
 
@@ -881,7 +1004,7 @@ aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --
 docker push $ECR_URI:$IMAGE_TAG
 
 # Tell the platform which image to deploy (CodeDeploy/Ansible read this)
-aws ssm put-parameter --name "/bluegreen/$ENV/image_tag" --type String --value "$IMAGE_TAG" --overwrite --region $AWS_REGION
+aws ssm put-parameter --name "/{project}/$ENV/image_tag" --type String --value "$IMAGE_TAG" --overwrite --region $AWS_REGION
 ```
 
 For **dev**, repeat with `ENV=dev` and the dev ECR repo.

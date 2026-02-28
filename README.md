@@ -13,6 +13,13 @@ CrewAI-based DevOps: generate deployment projects and run Terraform → Build �
 | **infra/modules/platform/** | Full Terraform platform module (VPC, ALB, ASG, ECR, SSM, CodeDeploy, etc.). **Full-Orchestrator** copies this into generated output when present. |
 | **CICD-With-AI/** | Reference repo: infra (Terraform), app, deploy, Ansible, GitHub Actions. Pipeline uses it for Terraform; app can be **crew-DevOps/app** or **CICD-With-AI/app**. |
 
+## Deploy
+
+- **Render** (free tier): Connect GitHub → Blueprint. See [Combined-Crew/DEPLOY.md](Combined-Crew/DEPLOY.md#render).
+- **Hugging Face**: Model repo + Space. See [Combined-Crew/DEPLOY.md](Combined-Crew/DEPLOY.md#hugging-face).
+
+---
+
 ## Quick start
 
 - **Generate a project:** `cd Full-Orchestrator && python run.py` → see **output/RUN_ORDER.md**.

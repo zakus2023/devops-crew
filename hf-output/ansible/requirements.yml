@@ -1,0 +1,6 @@
+# Install: ansible-galaxy collection install -r ansible/requirements.yml
+collections:
+  - name: amazon.aws
+    version: ">=5.0"
+  - name: community.aws
+    version: ">=4.0"
