@@ -11,8 +11,8 @@ output "codedeploy_group" {
   description = "CodeDeploy deployment group (null when enable_ecs=true or enable_codedeploy=false)."
 }
 output "artifacts_bucket" {
-  value       = var.enable_ecs ? null : aws_s3_bucket.artifacts[0].bucket
-  description = "CodeDeploy/Ansible artifacts bucket (null when enable_ecs=true)."
+  value       = var.enable_ecs || !var.enable_codedeploy ? null : aws_s3_bucket.artifacts[0].bucket
+  description = "CodeDeploy/Ansible artifacts bucket (null when enable_ecs=true or enable_codedeploy=false)."
 }
 output "bastion_public_ip" {
   value       = var.enable_bastion && !var.enable_ecs && var.key_name != "" ? aws_instance.bastion[0].public_ip : null

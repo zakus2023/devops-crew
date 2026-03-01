@@ -27,14 +27,15 @@ for _path in [
     if _path not in sys.path:
         sys.path.append(_path)
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv(os.path.join(_THIS_DIR, ".env"))
-except ImportError:
-    pass
-
-
 def main() -> int:
+    # Load .env AFTER reading the job file so env vars from .env do not override UI/job values.
+    # Job values (deploy_method, etc.) are passed explicitly to run_crew and will be set into
+    # os.environ there — so .env is only a fallback for vars not provided by the UI.
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(os.path.join(_THIS_DIR, ".env"), override=False)
+    except ImportError:
+        pass
     if len(sys.argv) < 2:
         print("Usage: python run_cli.py /path/to/job.json", file=sys.stderr)
         return 1

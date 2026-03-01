@@ -325,6 +325,83 @@ def _get_scripts_dir() -> str:
     return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Combined-Crew", "scripts")
 
 
+def _import_bootstrap_on_conflict(root: str, project: str = "bluegreen", region: str = "us-east-1") -> str:
+    """Import existing bootstrap resources when apply fails with already-exists. Returns combined result string."""
+    bootstrap_dir = os.path.join(root, "infra", "bootstrap")
+    if not os.path.isdir(bootstrap_dir):
+        return f"Error: bootstrap directory not found: {bootstrap_dir}"
+    results = []
+    tflock = f"{project}-tflock"
+    role = f"{project}-build-runner"
+    sg_name = f"{project}-build-runner"
+
+    for addr, rid in [
+        ("aws_dynamodb_table.tflock", tflock),
+        ("aws_iam_role.build_runner", role),
+        ("aws_iam_instance_profile.build_runner", role),
+    ]:
+        try:
+            r = subprocess.run(
+                ["terraform", "import", addr, rid],
+                cwd=bootstrap_dir,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env={**os.environ, "TF_IN_AUTOMATION": "1"},
+            )
+            if r.returncode == 0:
+                results.append(f"{addr}: imported OK")
+            else:
+                err = (r.stderr or r.stdout or "").strip()
+                if "already in state" in err or "already managed" in err:
+                    results.append(f"{addr}: skip (already in state)")
+                elif "does not exist" in err or "Cannot import" in err:
+                    results.append(f"{addr}: skip (not found)")
+                else:
+                    results.append(f"{addr}: {err[:120]}")
+        except Exception as e:
+            results.append(f"{addr}: {type(e).__name__}: {str(e)[:80]}")
+
+    try:
+        import boto3
+        ec2 = boto3.client("ec2", region_name=region)
+        default_vpc = ec2.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])
+        vpc_id = default_vpc["Vpcs"][0]["VpcId"] if default_vpc.get("Vpcs") else None
+        if vpc_id:
+            sgs = ec2.describe_security_groups(
+                Filters=[
+                    {"Name": "group-name", "Values": [sg_name]},
+                    {"Name": "vpc-id", "Values": [vpc_id]},
+                ]
+            )
+            if sgs.get("SecurityGroups"):
+                sg_id = sgs["SecurityGroups"][0]["GroupId"]
+                r = subprocess.run(
+                    ["terraform", "import", "aws_security_group.build_runner", sg_id],
+                    cwd=bootstrap_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env={**os.environ, "TF_IN_AUTOMATION": "1"},
+                )
+                if r.returncode == 0:
+                    results.append("aws_security_group.build_runner: imported OK")
+                else:
+                    err = (r.stderr or r.stdout or "").strip()
+                    if "already in state" in err:
+                        results.append("aws_security_group.build_runner: skip (already in state)")
+                    else:
+                        results.append(f"aws_security_group.build_runner: {err[:120]}")
+            else:
+                results.append("aws_security_group.build_runner: skip (not found)")
+        else:
+            results.append("aws_security_group.build_runner: skip (no default VPC)")
+    except Exception as e:
+        results.append(f"aws_security_group.build_runner: {type(e).__name__}: {str(e)[:80]}")
+
+    return "import_bootstrap_on_conflict: " + "; ".join(results)
+
+
 @tool("Run the full infra pipeline automatically: resolve limits, remove blockers, bootstrap init/plan/apply, update backend, dev init/plan/apply, prod init/plan/apply. Handles IAM import retry on conflict. Input: region (default us-east-1). Call this instead of individual terraform steps.")
 def run_full_infra_pipeline(region: str = "us-east-1") -> str:
     """
@@ -354,6 +431,20 @@ def run_full_infra_pipeline(region: str = "us-east-1") -> str:
     _run(terraform_plan, "infra/bootstrap")
     if allow_apply:
         r = _run(terraform_apply, "infra/bootstrap")
+        if "FAIL" in r and any(
+            x in r
+            for x in (
+                "ResourceInUseException",
+                "EntityAlreadyExists",
+                "InvalidGroup.Duplicate",
+                "Table already exists",
+                "already exists",
+            )
+        ):
+            root = get_repo_root()
+            project = _parse_tfvars(os.path.join(root, "infra", "bootstrap"), None).get("project", "bluegreen") or "bluegreen"
+            lines.append(_import_bootstrap_on_conflict(root, project, region))
+            r = _run(terraform_apply, "infra/bootstrap")
         if "FAIL" in r:
             return "\n".join(lines)
 
@@ -1402,8 +1493,13 @@ def run_ssh_deploy(env: str = "prod", region: Optional[str] = None, ssh_user: st
             img_path = _ssm_path(tag_val, "image_tag")
             repo_path = _ssm_path(tag_val, "ecr_repo_name")
             script = (
-                "set -e; "
                 "export AWS_REGION=%s; "
+                # Wait up to 3 minutes for Docker daemon to be ready (instances may still be running user-data)
+                "for i in $(seq 1 36); do "
+                "  sudo docker info >/dev/null 2>&1 && break; "
+                "  echo \"Waiting for Docker daemon ($i/36)...\"; sleep 5; "
+                "done; "
+                "sudo docker info >/dev/null 2>&1 || { echo 'Docker daemon not ready after 3min'; exit 1; }; "
                 "IMAGE_TAG=$(aws ssm get-parameter --name %s --query Parameter.Value --output text 2>/dev/null || true); "
                 "ECR_REPO=$(aws ssm get-parameter --name %s --query Parameter.Value --output text 2>/dev/null || true); "
                 "if [ -z \"$IMAGE_TAG\" ] || [ -z \"$ECR_REPO\" ]; then echo MISSING_SSM; exit 1; fi; "
@@ -1417,7 +1513,7 @@ def run_ssh_deploy(env: str = "prod", region: Optional[str] = None, ssh_user: st
             for addr in addrs:
                 cmd = ["ssh"] + ssh_opts + [f"{ssh_user}@{addr}", script]
                 try:
-                    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+                    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
                     if result.returncode == 0:
                         out_lines.append(f"{addr}: OK")
                     else:

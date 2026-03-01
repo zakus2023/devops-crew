@@ -11,8 +11,8 @@ locals {
   ami = var.ami_id != "" ? var.ami_id : data.aws_ami.al2023.id
   user_data = <<-EOF
     #!/bin/bash
-    set -e
-    log() { echo "[$(date -u +%FT%TZ)] $*"; }
+    # Do NOT use set -e — we must not exit early; Docker must always start.
+    log() { echo "[$(date -u +%FT%TZ)] $*" | tee -a /var/log/user-data.log; }
     retry() {
       local n=0
       local max=12
@@ -20,14 +20,16 @@ locals {
       until "$@"; do
         n=$((n+1))
         if [ "$n" -ge "$max" ]; then
+          log "WARN: command failed after $max attempts: $*"
           return 1
         fi
         log "retry $n/$max: $*"
         sleep "$delay"
       done
     }
+    log "=== user-data start ==="
     echo "${var.env}" > /opt/bluegreen-env
-    REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region || true)
+    REGION=$(curl -s --connect-timeout 5 http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null || true)
     if [ -z "$REGION" ]; then
       REGION="${var.region}"
     fi
@@ -36,16 +38,31 @@ locals {
       PKG_MGR="dnf"
     fi
     log "Refreshing package metadata"
-    retry $PKG_MGR clean all
-    retry $PKG_MGR makecache --setopt=skip_if_unavailable=true
+    retry $PKG_MGR clean all || true
+    retry $PKG_MGR makecache --setopt=skip_if_unavailable=true || true
     log "Installing base packages"
-    retry $PKG_MGR update -y --setopt=skip_if_unavailable=true
-    retry $PKG_MGR install -y docker wget amazon-cloudwatch-agent --setopt=skip_if_unavailable=true
-    systemctl enable docker
-    systemctl start docker
-    /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
-      -a fetch-config -m ec2 \
-      -c ssm:/${var.project}/${var.env}/cloudwatch/agent-config -s
+    retry $PKG_MGR update -y --setopt=skip_if_unavailable=true || true
+    retry $PKG_MGR install -y docker wget amazon-cloudwatch-agent --setopt=skip_if_unavailable=true || true
+    log "Starting Docker"
+    systemctl enable docker || true
+    systemctl start docker || true
+    # Wait until Docker daemon is responsive (up to 120s)
+    for i in $(seq 1 24); do
+      if docker info >/dev/null 2>&1; then
+        log "Docker daemon ready after $((i*5))s"
+        break
+      fi
+      log "Waiting for Docker daemon ($i/24)..."
+      sleep 5
+    done
+    # CloudWatch agent config — non-fatal; SSM param may not exist yet
+    if [ -f /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl ]; then
+      /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+        -a fetch-config -m ec2 \
+        -c ssm:/${var.project}/${var.env}/cloudwatch/agent-config -s 2>/dev/null || \
+        log "WARN: CloudWatch agent config not found in SSM — skipping"
+    fi
+    log "=== user-data done ==="
   EOF
 }
 

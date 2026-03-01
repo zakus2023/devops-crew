@@ -187,9 +187,9 @@ Summarize build and push result.""",
         )
 
     task_deploy = Task(
-        description=f"""Trigger deployment so the new image runs in prod. You MUST actually call the deploy tool — do not stop to ask the user for confirmation when you can get values from tools. Use DEPLOY_METHOD from .env: ansible | ssh_script | ecs.
+        description=f"""Trigger deployment so the new image runs in prod. You MUST actually call the deploy tool — do not stop to ask the user for confirmation when you can get values from tools. Priority: UI input first, then DEPLOY_METHOD from .env.
 
-Deploy method for this run (from .env DEPLOY_METHOD): **{deploy_method or "ansible"}**
+Deploy method for this run: **{deploy_method or "ansible"}**
 
 **{deploy_instruction}**""",
         expected_output="Summary: Deployment triggered (Ansible result, SSH deploy per-instance status, or ECS update), or clear instructions and current image_tag.",

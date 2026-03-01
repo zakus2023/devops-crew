@@ -1,12 +1,12 @@
 # CodeDeploy and artifacts bucket only when NOT using ECS (EC2 blue/green path).
 resource "aws_s3_bucket" "artifacts" {
-  count         = var.enable_ecs ? 0 : 1
+  count         = var.enable_ecs || !var.enable_codedeploy ? 0 : 1
   bucket_prefix = "${var.project}-${var.env}-codedeploy-"
   force_destroy = true
 }
 
 resource "aws_s3_bucket_public_access_block" "artifacts" {
-  count                   = var.enable_ecs ? 0 : 1
+  count                   = var.enable_ecs || !var.enable_codedeploy ? 0 : 1
   bucket                  = aws_s3_bucket.artifacts[0].id
   block_public_acls       = true
   block_public_policy     = true
@@ -32,7 +32,7 @@ resource "aws_iam_role" "codedeploy_role" {
 }
 
 resource "aws_iam_role_policy_attachment" "codedeploy" {
-  count      = var.enable_ecs ? 0 : 1
+  count      = var.enable_ecs || !var.enable_codedeploy ? 0 : 1
   role       = aws_iam_role.codedeploy_role[0].name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole"
 }
