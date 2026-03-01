@@ -123,6 +123,7 @@ If you are the sole user and prefer to set keys once, you can add them in **Envi
 - **Sleep:** Service sleeps after ~15 minutes of inactivity. The first request after sleep may take 30–60 seconds to wake.
 - **Build minutes:** Free tier has limited build minutes per month.
 - **Output:** Output is ephemeral; use **Download output** before the service sleeps or restarts.
+- **Memory:** Free tier has 512 MB RAM. The image is optimized (no Docker CLI; Build uses CodeBuild). If you hit memory limits, see [Memory limits](#memory-limits).
 
 ---
 
@@ -137,6 +138,21 @@ git push
 ```
 
 Render auto-deploys on push. Or use **Manual Deploy** in the dashboard.
+
+---
+
+### Memory limits
+
+Free tier (512 MB) is supported. The image is optimized: Docker CLI omitted (Build uses CodeBuild), and memory is freed after each run. If you see **"Web Service exceeded its memory limit"**:
+
+1. **Try again** — Restarts are automatic; the next run may succeed.
+2. **Run locally for heavy workloads** — `python ui.py` on your machine for full pipeline runs.
+3. **Upgrade if needed** — Render dashboard → **Settings** → **Instance Type** → **Standard** (2 GB, $25/mo).
+
+| Instance | RAM | Cost |
+|----------|-----|------|
+| Free | 512 MB | $0 |
+| Standard | 2 GB | $25/mo |
 
 ---
 
@@ -214,6 +230,7 @@ When `docker build` fails (HF/Render containers lack Docker socket):
 | Issue | Solution |
 |-------|----------|
 | "OPENAI_API_KEY required" | Expand **Environment variables** in the UI and add `OPENAI_API_KEY=sk-...` |
+| Exceeded memory limit (Render) | Free tier is supported; restarts are automatic. For repeated failures, upgrade to **Standard** (2 GB) in Settings → Instance Type. |
 | Build fails (docker not found) | Expected. Use CodeBuild or pre-built image |
 | 401 / Repository Not Found (HF) | Add `HF_TOKEN` in Space Settings; ensure `DEVOPS_CREW_MODEL` matches model repo |
 | Module not found | Ensure Full-Orchestrator, Multi-Agent-Pipeline, infra in model/repo |

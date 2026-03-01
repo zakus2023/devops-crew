@@ -500,6 +500,8 @@ def run_combined_crew(
                     shutil.rmtree(app_extract_dir, ignore_errors=True)
                 except Exception:
                     pass
+            import gc
+            gc.collect()  # Free memory after pipeline (helps free tier 512MB)
             done.set()
 
     thread = threading.Thread(target=_run)

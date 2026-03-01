@@ -18,9 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-# Docker CLI (Build step uses CodeBuild/ecr fallback when socket unavailable)
-RUN apt-get update && apt-get install -y --no-install-recommends docker.io \
-    && rm -rf /var/lib/apt/lists/*
+# Skip Docker CLI on Render (no socket) — Build uses CodeBuild/ecr fallback. Saves ~50MB for free tier.
 
 WORKDIR /app
 

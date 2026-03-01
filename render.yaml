@@ -1,6 +1,6 @@
 # Render Blueprint for DevOps-Crew
 # Deploy: Connect this repo to Render → New → Blueprint → select render.yaml
-# Free tier: plan: free (services sleep after ~15 min inactivity)
+# Free tier: plan: free (512 MB; optimized for free tier)
 # Credentials: Users provide their own OPENAI_API_KEY and AWS keys in the app UI (Environment variables section).
 services:
   - type: web
