@@ -116,6 +116,8 @@ def run_crew(
             deploy_method = "ecs"
         elif deploy_method == "shs_script":
             deploy_method = "ssh_script"
+        elif deploy_method == "codedeploy":
+            deploy_method = "ssh_script"  # CodeDeploy not used; fallback to SSH
         elif deploy_method not in ("ansible", "ssh_script", "ecs"):
             deploy_method = "ansible"
         os.environ["DEPLOY_METHOD"] = deploy_method

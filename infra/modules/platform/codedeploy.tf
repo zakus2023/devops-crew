@@ -15,7 +15,7 @@ resource "aws_s3_bucket_public_access_block" "artifacts" {
 }
 
 data "aws_iam_policy_document" "codedeploy_assume" {
-  count = var.enable_ecs ? 0 : 1
+  count = var.enable_ecs || !var.enable_codedeploy ? 0 : 1
   statement {
     actions = ["sts:AssumeRole"]
     principals {
@@ -26,7 +26,7 @@ data "aws_iam_policy_document" "codedeploy_assume" {
 }
 
 resource "aws_iam_role" "codedeploy_role" {
-  count                = var.enable_ecs ? 0 : 1
+  count                = var.enable_ecs || !var.enable_codedeploy ? 0 : 1
   name                 = "${var.project}-${var.env}-codedeploy-role"
   assume_role_policy   = data.aws_iam_policy_document.codedeploy_assume[0].json
 }
@@ -38,7 +38,7 @@ resource "aws_iam_role_policy_attachment" "codedeploy" {
 }
 
 resource "aws_iam_policy" "codedeploy_autoscaling" {
-  count  = var.enable_ecs ? 0 : 1
+  count  = var.enable_ecs || !var.enable_codedeploy ? 0 : 1
   name   = "${var.project}-${var.env}-codedeploy-autoscaling"
   policy = jsonencode({
     Version = "2012-10-17"
@@ -62,25 +62,25 @@ resource "aws_iam_policy" "codedeploy_autoscaling" {
 }
 
 resource "aws_iam_role_policy_attachment" "codedeploy_autoscaling" {
-  count      = var.enable_ecs ? 0 : 1
+  count      = var.enable_ecs || !var.enable_codedeploy ? 0 : 1
   role       = aws_iam_role.codedeploy_role[0].name
   policy_arn = aws_iam_policy.codedeploy_autoscaling[0].arn
 }
 
 resource "aws_iam_role_policy_attachment" "codedeploy_autoscaling_full" {
-  count      = var.enable_ecs ? 0 : 1
+  count      = var.enable_ecs || !var.enable_codedeploy ? 0 : 1
   role       = aws_iam_role.codedeploy_role[0].name
   policy_arn = "arn:aws:iam::aws:policy/AutoScalingFullAccess"
 }
 
 resource "aws_codedeploy_app" "app" {
-  count              = var.enable_ecs ? 0 : 1
+  count              = var.enable_ecs || !var.enable_codedeploy ? 0 : 1
   name               = "${var.project}-${var.env}-codedeploy-app"
   compute_platform   = "Server"
 }
 
 resource "aws_codedeploy_deployment_group" "dg" {
-  count                  = var.enable_ecs ? 0 : 1
+  count                  = var.enable_ecs || !var.enable_codedeploy ? 0 : 1
   app_name               = aws_codedeploy_app.app[0].name
   deployment_group_name  = "${var.project}-${var.env}-dg"
   service_role_arn       = aws_iam_role.codedeploy_role[0].arn

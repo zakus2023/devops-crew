@@ -372,7 +372,7 @@ def run_full_infra_pipeline(region: str = "us-east-1") -> str:
             if "FAIL" not in r:
                 return r
             # Already-exists conflicts: import into state and retry (IAM roles, IAM policy, CloudWatch, CodeDeploy)
-            if any(x in r for x in ("EntityAlreadyExists", "ResourceAlreadyExistsException", "ApplicationAlreadyExistsException", "already exists")):
+            if any(x in r for x in ("EntityAlreadyExists", "ResourceAlreadyExistsException", "ApplicationAlreadyExistsException", "DeploymentGroupAlreadyExistsException", "already exists")):
                 _run(run_import_platform_iam_on_conflict, path, var_file)
                 _run(run_import_existing_platform_resources, path, var_file)
                 r = _run(terraform_apply, path, var_file)
@@ -488,14 +488,14 @@ def run_import_platform_iam_on_conflict(relative_path: str, var_file: Optional[s
     project = vars_d.get("project", "bluegreen")
     env = vars_d.get("env") or ("prod" if "prod" in relative_path else "dev")
     enable_ecs = vars_d.get("enable_ecs", "false").lower() in ("true", "1", "yes")
+    enable_codedeploy = vars_d.get("enable_codedeploy", "false").lower() in ("true", "1", "yes")
     if enable_ecs:
         return "Skipped: enable_ecs=true (ECS path); ec2_role and codedeploy_role have count=0."
     ec2_role_name = f"{project}-{env}-ec2-role"
     codedeploy_role_name = f"{project}-{env}-codedeploy-role"
-    imports = [
-        ("module.platform.aws_iam_role.ec2_role[0]", ec2_role_name),
-        ("module.platform.aws_iam_role.codedeploy_role[0]", codedeploy_role_name),
-    ]
+    imports = [("module.platform.aws_iam_role.ec2_role[0]", ec2_role_name)]
+    if enable_codedeploy:
+        imports.append(("module.platform.aws_iam_role.codedeploy_role[0]", codedeploy_role_name))
     # Terraform import needs -var-file to resolve required variables when loading config
     import_cmd_base = ["terraform", "import"]
     if var_file:
@@ -539,6 +539,7 @@ def run_import_existing_platform_resources(relative_path: str, var_file: Optiona
     project = vars_d.get("project", "bluegreen")
     env = vars_d.get("env") or ("prod" if "prod" in relative_path else "dev")
     enable_ecs = vars_d.get("enable_ecs", "false").lower() in ("true", "1", "yes")
+    enable_codedeploy = vars_d.get("enable_codedeploy", "false").lower() in ("true", "1", "yes")
 
     # Terraform import needs -var-file to resolve required variables when loading config
     import_cmd_base = ["terraform", "import"]
@@ -580,19 +581,23 @@ def run_import_existing_platform_resources(relative_path: str, var_file: Optiona
         except Exception as e:
             results.append(f"{addr}: {type(e).__name__}: {e}")
 
-    # IAM policy and CodeDeploy app (only when enable_ecs=false)
-    if not enable_ecs:
+    # IAM policy, CodeDeploy app, and deployment group (only when enable_ecs=false and enable_codedeploy=true)
+    if not enable_ecs and enable_codedeploy:
         policy_name = f"{project}-{env}-codedeploy-autoscaling"
         app_name = f"{project}-{env}-codedeploy-app"
+        dg_name = f"{project}-{env}-dg"
         region = vars_d.get("region", "us-east-1")
         try:
             import boto3
             sts = boto3.client("sts", region_name=region)
             account = sts.get_caller_identity()["Account"]
             policy_arn = f"arn:aws:iam::{account}:policy/{policy_name}"
+            # Import format for aws_codedeploy_deployment_group: app_name:deployment_group_name
+            dg_import_id = f"{app_name}:{dg_name}"
             for addr, rid in [
                 ("module.platform.aws_iam_policy.codedeploy_autoscaling[0]", policy_arn),
                 ("module.platform.aws_codedeploy_app.app[0]", app_name),
+                ("module.platform.aws_codedeploy_deployment_group.dg[0]", dg_import_id),
             ]:
                 try:
                     cmd = import_cmd_base + [addr, rid]
@@ -803,64 +808,46 @@ def ecr_list_image_tags(ecr_repo_name: str, region: Optional[str] = None) -> str
                 tags.append(t)
         tags = sorted(set(tags), reverse=True)[:10]
         if not tags:
-            return f"ECR {ecr_repo_name}: no images found. Build and push via GitHub Actions (.github/workflows/build-push.yml) or locally first."
+            return f"ECR {ecr_repo_name}: no images found. Build and push locally or via EC2 build runner (pipeline uses ec2_docker_build_and_push when Docker unavailable)."
         return f"ECR {ecr_repo_name} tags: {', '.join(tags)}. Use write_ssm_image_tag with one of these."
     except Exception as e:
         return f"Error: {type(e).__name__}: {str(e)[:250]}"
 
 
-def _get_codebuild_log_tail(cb_client, build_id: str, region: str, project: str, max_lines: int = 40) -> str:
-    """Fetch last lines of CodeBuild CloudWatch log for failed builds."""
-    try:
-        resp = cb_client.batch_get_builds(ids=[build_id])
-        builds = resp.get("builds", [])
-        if not builds:
-            return ""
-        logs_info = builds[0].get("logs", {})
-        cw = logs_info.get("cloudWatchLogs", {})
-        group = cw.get("groupName")
-        stream = cw.get("streamName")
-        if not group or not stream:
-            return ""
-        import boto3
-        logs = boto3.client("logs", region_name=region)
-        resp = logs.get_log_events(logGroupName=group, logStreamName=stream, limit=max_lines, startFromHead=False)
-        events = resp.get("events", [])
-        if not events:
-            return ""
-        lines = [e.get("message", "").rstrip() for e in reversed(events)]
-        tail = "\n".join(lines[-max_lines:])
-        return f"Last log lines:\n{tail}\n\n"
-    except Exception:
-        return ""
-
-
-@tool("Build the app via AWS CodeBuild when Docker is unavailable. Zips app, uploads to S3, runs CodeBuild, updates SSM image_tag. Input: ecr_repo_name (e.g. bluegreen-prod-app), app_relative_path (default 'app'), region optional. Requires bootstrap applied (build_source_bucket, codebuild_project outputs).")
-def codebuild_build_and_push(
+@tool("Build the app via EC2 build runner when Docker is unavailable. Zips app dir or uploads existing zip, uploads to S3, runs SSM command on EC2 to docker build/push, updates SSM image_tag. Input: ecr_repo_name (e.g. bluegreen-prod-app), app_relative_path (default 'app' — dir or .zip file), region optional. Requires bootstrap applied (build_source_bucket, build_runner_instance_id outputs).")
+def ec2_docker_build_and_push(
     ecr_repo_name: str,
     app_relative_path: str = "app",
     region: Optional[str] = None,
 ) -> str:
     """
     When Docker is unavailable (e.g. Hugging Face Space), build the app using
-    AWS CodeBuild. Zips the app directory, uploads to S3, starts CodeBuild,
-    waits for completion, then updates SSM image_tag. Automatic fallback — no
-    manual steps. Requires bootstrap Terraform applied (build_source_bucket,
-    codebuild_project outputs).
+    the EC2 build runner. If app_relative_path is a directory, zips it; if
+    it's already a .zip file, uploads it directly. Uploads to S3, runs SSM
+    Run Command on the build runner EC2 to docker build, push to ECR, and
+    update SSM image_tag. Requires bootstrap applied (build_source_bucket,
+    build_runner_instance_id).
     """
     region = region or os.environ.get("AWS_REGION", "us-east-1")
     root = get_repo_root()
     app_root = get_app_root()
-    work_dir = app_root if app_root else os.path.join(root, app_relative_path)
-    if not os.path.isdir(work_dir):
-        return f"Error: app directory not found: {work_dir}"
-    dockerfile_path = os.path.join(work_dir, "Dockerfile")
-    if not os.path.isfile(dockerfile_path):
-        return f"Error: Dockerfile not found in {work_dir}. App must contain a Dockerfile for CodeBuild."
+    app_path = app_root if app_root else os.path.join(root, app_relative_path)
+    if not os.path.exists(app_path):
+        return f"Error: app path not found: {app_path}"
+
+    # If directory: verify Dockerfile and zip it
+    if os.path.isdir(app_path):
+        dockerfile_path = os.path.join(app_path, "Dockerfile")
+        if not os.path.isfile(dockerfile_path):
+            return f"Error: Dockerfile not found in {app_path}. App must contain a Dockerfile."
+    elif app_path.lower().endswith(".zip"):
+        # Already zipped — upload directly (Dockerfile check done on EC2)
+        pass
+    else:
+        return f"Error: app path must be a directory or .zip file, got: {app_path}"
 
     try:
         import boto3
-        # Get bootstrap outputs
         bootstrap_dir = os.path.join(root, "infra", "bootstrap")
         if not os.path.isdir(bootstrap_dir):
             return "Error: infra/bootstrap not found. Run Generate and Infra steps first."
@@ -875,84 +862,92 @@ def codebuild_build_and_push(
             return f"Error: build_source_bucket not found in bootstrap. Run terraform apply in infra/bootstrap first. stderr: {(r.stderr or r.stdout or '')[:200]}"
         bucket = r.stdout.strip()
         r = subprocess.run(
-            ["terraform", "output", "-raw", "codebuild_project"],
+            ["terraform", "output", "-raw", "build_runner_instance_id"],
             cwd=bootstrap_dir,
             capture_output=True,
             text=True,
             timeout=15,
         )
         if r.returncode != 0:
-            return f"Error: codebuild_project not found in bootstrap. stderr: {(r.stderr or r.stdout or '')[:200]}"
-        project = r.stdout.strip()
+            return f"Error: build_runner_instance_id not found in bootstrap. stderr: {(r.stderr or r.stdout or '')[:200]}"
+        instance_id = r.stdout.strip()
 
         sts = boto3.client("sts", region_name=region)
         account = sts.get_caller_identity()["Account"]
-        image_tag = f"codebuild-{int(time.time())}"
+        image_tag = f"ec2-{int(time.time())}"
+        ecr_uri = f"{account}.dkr.ecr.{region}.amazonaws.com/{ecr_repo_name}"
+        ssm_path = _ssm_path("prod", "image_tag")
 
-        # Zip app directory
-        zip_path = os.path.join(tempfile.gettempdir(), f"app-{image_tag}.zip")
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for dirpath, _, filenames in os.walk(work_dir):
-                for fn in filenames:
-                    fp = os.path.join(dirpath, fn)
-                    arc = os.path.relpath(fp, work_dir)
-                    zf.write(fp, arc)
-
-        # Upload to S3
         s3 = boto3.client("s3", region_name=region)
-        s3.upload_file(zip_path, bucket, "app.zip")
-        try:
-            os.remove(zip_path)
-        except OSError:
-            pass
+        if os.path.isdir(app_path):
+            zip_path = os.path.join(tempfile.gettempdir(), f"app-{image_tag}.zip")
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for dirpath, _, filenames in os.walk(app_path):
+                    for fn in filenames:
+                        fp = os.path.join(dirpath, fn)
+                        arc = os.path.relpath(fp, app_path)
+                        zf.write(fp, arc)
+            s3.upload_file(zip_path, bucket, "app.zip")
+            try:
+                os.remove(zip_path)
+            except OSError:
+                pass
+        else:
+            s3.upload_file(app_path, bucket, "app.zip")
 
-        # Start CodeBuild (with automatic retry on failure)
-        cb = boto3.client("codebuild", region_name=region)
-        env_override = [
-            {"name": "IMAGE_TAG", "value": image_tag, "type": "PLAINTEXT"},
-            {"name": "ECR_REPO", "value": ecr_repo_name, "type": "PLAINTEXT"},
-            {"name": "AWS_ACCOUNT_ID", "value": account, "type": "PLAINTEXT"},
-            {"name": "AWS_REGION", "value": region, "type": "PLAINTEXT"},
-        ]
-        for attempt in range(2):  # Initial try + 1 automatic retry
-            if attempt > 0:
-                # Retry: re-upload zip (in case of S3 sync delay) and new build
-                image_tag = f"codebuild-{int(time.time())}-retry{attempt}"
-                env_override[0] = {"name": "IMAGE_TAG", "value": image_tag, "type": "PLAINTEXT"}
-                zip_path = os.path.join(tempfile.gettempdir(), f"app-{image_tag}.zip")
-                with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for dirpath, _, filenames in os.walk(work_dir):
-                        for fn in filenames:
-                            fp = os.path.join(dirpath, fn)
-                            arc = os.path.relpath(fp, work_dir)
-                            zf.write(fp, arc)
-                s3.upload_file(zip_path, bucket, "app.zip")
-                try:
-                    os.remove(zip_path)
-                except OSError:
-                    pass
-                time.sleep(3)  # Brief delay before retry
-            resp = cb.start_build(projectName=project, environmentVariablesOverride=env_override)
-            build_id = resp["build"]["id"]
-            for _ in range(120):
-                resp = cb.batch_get_builds(ids=[build_id])
-                if not resp["builds"]:
+        script = f"""#!/bin/bash
+set -e
+cd /tmp
+rm -rf app_build && mkdir -p app_build && cd app_build
+aws s3 cp s3://{bucket}/app.zip . --region {region}
+unzip -o app.zip
+aws ecr get-login-password --region {region} | docker login --username AWS --password-stdin {account}.dkr.ecr.{region}.amazonaws.com
+docker build -t {ecr_repo_name}:{image_tag} .
+docker tag {ecr_repo_name}:{image_tag} {ecr_uri}:{image_tag}
+docker push {ecr_uri}:{image_tag}
+aws ssm put-parameter --name "{ssm_path}" --value "{image_tag}" --type String --overwrite --region {region}
+echo "DONE"
+"""
+
+        ssm = boto3.client("ssm", region_name=region)
+
+        # Wait for instance to be SSM-ready (1–3 min after bootstrap apply)
+        for _ in range(36):
+            try:
+                info = ssm.describe_instance_information(Filters=[{"Key": "InstanceIds", "Values": [instance_id]}])
+                instances = info.get("InstanceInformationList", [])
+                if instances and instances[0].get("PingStatus") == "Online":
                     break
-                status = resp["builds"][0]["buildStatus"]
-                if status == "SUCCEEDED":
-                    ssm = boto3.client("ssm", region_name=region)
-                    ssm_path = _ssm_path("prod", "image_tag")
-                    ssm.put_parameter(Name=ssm_path, Value=image_tag, Type="String", Overwrite=True)
-                    return f"CodeBuild OK. SSM {ssm_path} = {image_tag}. Deploy can proceed."
-                if status in ("FAILED", "FAULT", "STOPPED", "TIMED_OUT"):
-                    if attempt < 1:
-                        break  # Exit poll loop to retry
-                    time.sleep(2)
-                    log_tail = _get_codebuild_log_tail(cb, build_id, region, project)
-                    return f"CodeBuild FAILED: {status} (after retry).\n{log_tail}Full logs: /aws/codebuild/{project}"
-                time.sleep(5)
-            if attempt >= 1:
-                return "CodeBuild timed out (10 min). Check AWS CodeBuild console."
+            except Exception:
+                pass
+            time.sleep(5)
+        else:
+            return "Error: EC2 build runner not ready for SSM after 3 min. Wait 2–3 min after bootstrap apply and retry."
+
+        resp = ssm.send_command(
+            InstanceIds=[instance_id],
+            DocumentName="AWS-RunShellScript",
+            Parameters={"commands": [script]},
+            TimeoutSeconds=600,
+        )
+        cmd_id = resp["Command"]["CommandId"]
+
+        for _ in range(130):
+            try:
+                inv = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=instance_id)
+            except Exception as poll_err:
+                if "InvocationDoesNotExist" in str(poll_err) or "InvalidInstanceId" in str(poll_err):
+                    time.sleep(5)
+                    continue
+                raise
+            status = inv.get("Status", "Pending")
+            if status == "Success":
+                return f"EC2 build runner OK. SSM {ssm_path} = {image_tag}. Deploy can proceed."
+            if status in ("Failed", "Cancelled", "TimedOut"):
+                details = inv.get("StandardErrorContent", "") or inv.get("StandardOutputContent", "") or ""
+                return f"EC2 build runner FAILED: {status}. Output: {details[:500]}"
+            time.sleep(5)
+        return "EC2 build runner timed out (10 min). Check SSM Run Command in AWS console."
     except Exception as e:
         return f"Error: {type(e).__name__}: {str(e)[:300]}"
 

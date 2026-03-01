@@ -20,7 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Docker CLI (required for Build step; needs Docker socket: -v /var/run/docker.sock:/var/run/docker.sock)
-RUN apt-get update && apt-get install -y --no-install-recommends docker.io \
+# Install OpenSSH client for DEPLOY_METHOD=ssh_script (run_ssh_deploy uses ssh binary)
+RUN apt-get update && apt-get install -y --no-install-recommends docker.io openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Create user (HF Spaces run as uid 1000)

@@ -77,3 +77,9 @@ variable "enable_ecs" {
   type    = bool
   default = false
 }
+
+# CodeDeploy is not used; pipeline uses ssh_script, ansible (SSM), or ecs. When false, no CodeDeploy app/role/group or agent install.
+variable "enable_codedeploy" {
+  type    = bool
+  default = false
+}

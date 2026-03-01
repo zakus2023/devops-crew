@@ -86,7 +86,7 @@ Instead of running `python run.py requirements.json` from the command line, you 
    - AWS region  
 
 3. **Choose deploy method**  
-   - **ansible** — Uses Ansible/CodeDeploy  
+   - **ansible** — Uses Ansible over SSM (no CodeDeploy)  
    - **ssh_script** — Connects via SSH to EC2 instances  
    - **ecs** — Updates an ECS service  
 

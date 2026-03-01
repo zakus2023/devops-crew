@@ -154,7 +154,7 @@ resource "aws_s3_bucket_policy" "cloudtrail" {{
   }})
 }}
 
-# Build source bucket for CodeBuild (when Docker unavailable, e.g. Hugging Face Space)
+# Build source bucket for EC2 build runner (when Docker unavailable, e.g. Hugging Face Space)
 resource "aws_s3_bucket" "build_source" {{
   bucket_prefix = "${{var.project}}-build-source-"
   force_destroy = true
@@ -168,33 +168,48 @@ resource "aws_s3_bucket_public_access_block" "build_source" {{
   restrict_public_buckets = true
 }}
 
-# CodeBuild IAM role
-resource "aws_iam_role" "codebuild" {{
-  name = "${{var.project}}-codebuild"
+# EC2 build runner (replaces CodeBuild) — runs docker build on EC2 when Docker unavailable
+data "aws_vpc" "default" {{
+  default = true
+}}
+
+data "aws_subnets" "default" {{
+  filter {{
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }}
+}}
+
+data "aws_ami" "amazon_linux" {{
+  most_recent = true
+  owners      = ["amazon"]
+  filter {{
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
+  }}
+}}
+
+resource "aws_iam_role" "build_runner" {{
+  name = "${{var.project}}-build-runner"
   assume_role_policy = jsonencode({{
     Version = "2012-10-17"
     Statement = [{{
       Effect = "Allow"
-      Principal = {{ Service = "codebuild.amazonaws.com" }}
+      Principal = {{ Service = "ec2.amazonaws.com" }}
       Action = "sts:AssumeRole"
     }}]
   }})
 }}
 
-resource "aws_iam_role_policy" "codebuild" {{
-  role = aws_iam_role.codebuild.name
+resource "aws_iam_role_policy" "build_runner" {{
+  role = aws_iam_role.build_runner.name
   policy = jsonencode({{
     Version = "2012-10-17"
     Statement = [
       {{
         Effect = "Allow"
-        Action = ["s3:GetObject", "s3:PutObject"]
+        Action = ["s3:GetObject"]
         Resource = "arn:aws:s3:::${{aws_s3_bucket.build_source.bucket}}/*"
-      }},
-      {{
-        Effect = "Allow"
-        Action = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
-        Resource = "arn:aws:logs:*:*:log-group:/aws/codebuild/${{var.project}}-app-build"
       }},
       {{
         Effect = "Allow"
@@ -205,60 +220,55 @@ resource "aws_iam_role_policy" "codebuild" {{
         Effect = "Allow"
         Action = ["ecr:BatchCheckLayerAvailability", "ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage", "ecr:PutImage", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload"]
         Resource = "arn:aws:ecr:*:${{data.aws_caller_identity.current.account_id}}:repository/*"
+      }},
+      {{
+        Effect = "Allow"
+        Action = ["ssm:PutParameter", "ssm:GetParameter"]
+        Resource = "arn:aws:ssm:*:${{data.aws_caller_identity.current.account_id}}:parameter/*"
       }}
     ]
   }})
 }}
 
-resource "aws_codebuild_project" "app" {{
-  name          = "${{var.project}}-app-build"
-  service_role  = aws_iam_role.codebuild.arn
-  build_timeout = 600
+resource "aws_iam_role_policy_attachment" "build_runner_ssm" {{
+  role       = aws_iam_role.build_runner.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}}
 
-  artifacts {{
-    type = "NO_ARTIFACTS"
+resource "aws_iam_instance_profile" "build_runner" {{
+  name = "${{var.project}}-build-runner"
+  role = aws_iam_role.build_runner.name
+}}
+
+resource "aws_security_group" "build_runner" {{
+  name   = "${{var.project}}-build-runner"
+  vpc_id = data.aws_vpc.default.id
+  egress {{
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
   }}
+}}
 
-  environment {{
-    compute_type    = "BUILD_GENERAL1_SMALL"
-    image           = "aws/codebuild/amazonlinux2-x86_64-standard:5.0"
-    type            = "LINUX_CONTAINER"
-    privileged_mode = true
-  }}
+resource "aws_instance" "build_runner" {{
+  ami                    = data.aws_ami.amazon_linux.id
+  instance_type          = "t3.small"
+  subnet_id              = tolist(data.aws_subnets.default.ids)[0]
+  vpc_security_group_ids = [aws_security_group.build_runner.id]
+  iam_instance_profile   = aws_iam_instance_profile.build_runner.name
+  associate_public_ip_address = true
 
-  source {{
-    type      = "S3"
-    location  = "${{aws_s3_bucket.build_source.bucket}}/app.zip"
-    buildspec = <<-BUILDSPEC
-      version: 0.2
-      phases:
-        pre_build:
-          commands:
-            - cd $$CODEBUILD_SRC_DIR
-            - pwd
-            - ls -la
-            - echo "Logging in to ECR..."
-            - aws ecr get-login-password --region $$AWS_REGION | docker login --username AWS --password-stdin $$AWS_ACCOUNT_ID.dkr.ecr.$$AWS_REGION.amazonaws.com
-            - echo "Unzipping app source..."
-            - test -f app.zip || (echo "ERROR: app.zip not found"; ls -la; exit 1)
-            - unzip -o app.zip -d .
-            - echo "After unzip:"
-            - ls -la
-            - test -f Dockerfile || (echo "ERROR: Dockerfile not found after unzip"; exit 1)
-        build:
-          commands:
-            - echo "Building Docker image..."
-            - docker build -t app:$$IMAGE_TAG .
-            - docker tag app:$$IMAGE_TAG $$AWS_ACCOUNT_ID.dkr.ecr.$$AWS_REGION.amazonaws.com/$$ECR_REPO:$$IMAGE_TAG
-            - docker push $$AWS_ACCOUNT_ID.dkr.ecr.$$AWS_REGION.amazonaws.com/$$ECR_REPO:$$IMAGE_TAG
-      BUILDSPEC
-  }}
+  user_data = <<-EOT
+#!/bin/bash
+yum install -y docker unzip
+systemctl enable docker && systemctl start docker
+usermod -aG docker ec2-user
+  EOT
 
-  logs_config {{
-    cloudwatch_logs {{
-      group_name  = "/aws/codebuild/${{var.project}}-app-build"
-      stream_name = "build"
-    }}
+  tags = {{
+    Name = "${{var.project}}-build-runner"
+    Role = "build-runner"
   }}
 }}
 ''', output_dir)
@@ -283,8 +293,8 @@ output "build_source_bucket" {
   value = aws_s3_bucket.build_source.bucket
 }
 
-output "codebuild_project" {
-  value = aws_codebuild_project.app.name
+output "build_runner_instance_id" {
+  value = aws_instance.build_runner.id
 }
 ''', output_dir)
     return f"Bootstrap Terraform written to {output_dir}/infra/bootstrap (variables.tf, main.tf, outputs.tf)"
@@ -863,73 +873,12 @@ keyed_groups:
       register: validate_out
       failed_when: validate_out.rc != 0
 ''', output_dir)
-    return f"Deploy written to {output_dir}/deploy (CodeDeploy) and {output_dir}/ansible (Ansible). Set DEPLOY_METHOD=codedeploy or ansible."
+    return f"Deploy written to {output_dir}/deploy and {output_dir}/ansible. Set DEPLOY_METHOD=ssh_script, ansible, or ecs (CodeDeploy not used)."
 
 
 def generate_workflows(requirements: Dict[str, Any], output_dir: str) -> str:
-    """Generate GitHub Actions workflows (terraform-plan on PR, build-push on push to app/)."""
-    project = _get(requirements, "project") or "bluegreen"
-    # terraform-plan.yml: on PR to main touching infra/, assume AWS role, init+plan prod.
-    _write(".github/workflows/terraform-plan.yml", '''name: Terraform Plan
-on:
-  pull_request:
-    branches: [main]
-    paths: ["infra/**"]
-jobs:
-  plan:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          aws-region: ${{ secrets.AWS_REGION }}
-      - uses: hashicorp/setup-terraform@v3
-      - name: Terraform Plan
-        run: |
-          cd infra/envs/prod
-          terraform init -backend-config=backend.hcl -reconfigure
-          terraform plan -var-file=prod.tfvars
-''', output_dir)
-    # build-push.yml: on push to main touching app/, assume AWS role, get ECR repo from SSM, build/tag/push, update image_tag in SSM.
-    # Use regular string (not f-string) so ${{ }} and ${VAR} stay literal for GitHub Actions and bash.
-    _write(".github/workflows/build-push.yml", '''name: Build and Push Image
-on:
-  push:
-    branches: [main]
-    paths: ["app/**"]
-permissions:
-  id-token: write
-  contents: read
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          aws-region: ${{ secrets.AWS_REGION }}
-      - name: Get ECR repo
-        id: ssm
-        run: |
-          ECR_REPO=$(aws ssm get-parameter --name "/''' + project + '''/prod/ecr_repo_name" --query "Parameter.Value" --output text)
-          echo "ecr_repo_name=$ECR_REPO" >> $GITHUB_OUTPUT
-      - uses: aws-actions/amazon-ecr-login@v2
-      - name: Build and push
-        env:
-          ECR_REPO_NAME: ${{ steps.ssm.outputs.ecr_repo_name }}
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-        run: |
-          TAG=${GITHUB_SHA::12}
-          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          ECR_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO_NAME}"
-          docker build -t "${ECR_REPO_NAME}:${TAG}" app
-          docker tag "${ECR_REPO_NAME}:${TAG}" "${ECR_URI}:${TAG}"
-          docker push "${ECR_URI}:${TAG}"
-          aws ssm put-parameter --name "/''' + project + '''/prod/image_tag" --value "$TAG" --type String --overwrite --region $AWS_REGION
-''', output_dir)
-    return f"GitHub Actions workflows written to {output_dir}/.github/workflows/"
+    """Generate GitHub Actions workflows (disabled for now)."""
+    return "GitHub Actions workflows skipped (disabled)."
 
 
 def write_run_order(output_dir: str, run_order_text: str, project: str = "bluegreen") -> str:
@@ -979,13 +928,9 @@ terraform init -backend-config=backend.hcl -reconfigure
 terraform apply -auto-approve -var-file=prod.tfvars
 ```
 
-## 4. OIDC (GitHub Actions, optional)
-
-Create IAM OIDC provider and role for your GitHub repo, then add secrets: AWS_ROLE_TO_ASSUME, AWS_REGION. Skip if you deploy only manually.
-
 ---
 
-## 5. Build (Docker → ECR → SSM)
+## 4. Build (Docker → ECR → SSM)
 
 From the **project root** (this directory), after dev and prod are applied:
 
@@ -1003,7 +948,7 @@ docker build -t $ECR_URI:$IMAGE_TAG ./app
 aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
 docker push $ECR_URI:$IMAGE_TAG
 
-# Tell the platform which image to deploy (CodeDeploy/Ansible read this)
+# Tell the platform which image to deploy (pipeline/Ansible read this)
 aws ssm put-parameter --name "/{project}/$ENV/image_tag" --type String --value "$IMAGE_TAG" --overwrite --region $AWS_REGION
 ```
 
@@ -1011,33 +956,9 @@ For **dev**, repeat with `ENV=dev` and the dev ECR repo.
 
 ---
 
-## 6. Deploy (choose one)
+## 5. Deploy (choose one)
 
-### Option A — CodeDeploy
-
-From project root:
-
-```bash
-export AWS_REGION=us-east-1
-export ENV=prod
-BUCKET=$(cd infra/envs/$ENV && terraform output -raw artifacts_bucket)
-APP=$(cd infra/envs/$ENV && terraform output -raw codedeploy_app)
-GROUP=$(cd infra/envs/$ENV && terraform output -raw codedeploy_group)
-
-# Create deploy bundle and upload
-(cd deploy && zip -r ../deploy.zip .)
-S3_KEY=deploy-$(date +%Y%m%d%H%M%S).zip
-aws s3 cp deploy.zip s3://$BUCKET/$S3_KEY
-
-# Trigger deployment
-aws deploy create-deployment \\
-  --application-name $APP \\
-  --deployment-group-name $GROUP \\
-  --s3-location bucket=$BUCKET,key=$S3_KEY,bundleType=zip \\
-  --region $AWS_REGION
-```
-
-### Option B — Ansible
+### Option A — Ansible (SSM)
 
 From project root:
 
@@ -1053,9 +974,17 @@ ansible-playbook -i ansible/inventory/ec2_prod.aws_ec2.yml ansible/playbooks/dep
 
 For **dev**, use inventory `ansible/inventory/ec2_dev.aws_ec2.yml` and `env=dev`, and get `SSM_BUCKET` from `infra/envs/dev`.
 
+### Option B — SSH script
+
+Use when `DEPLOY_METHOD=ssh_script`. The pipeline's run_ssh_deploy discovers EC2 instances by tag, SSHs to each, and runs docker pull/restart. Set `SSH_KEY_PATH` or `SSH_PRIVATE_KEY` in .env; for private EC2s, set `BASTION_HOST`.
+
+### Option C — ECS
+
+Use when `DEPLOY_METHOD=ecs`. The pipeline's run_ecs_deploy updates the ECS service with the new image from SSM.
+
 ---
 
-## 7. Verify (optional)
+## 6. Verify (optional)
 
 ```bash
 # Health check (use your app URL from Terraform output)

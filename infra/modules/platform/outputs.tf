@@ -3,12 +3,12 @@ output "app_domain"     { value = var.domain_name }
 output "https_url"      { value = "https://${var.domain_name}" }
 output "ecr_repo"       { value = aws_ecr_repository.app.name }
 output "codedeploy_app" {
-  value       = var.enable_ecs ? null : aws_codedeploy_app.app[0].name
-  description = "CodeDeploy app name (null when enable_ecs=true)."
+  value       = var.enable_ecs || !var.enable_codedeploy ? null : aws_codedeploy_app.app[0].name
+  description = "CodeDeploy app name (null when enable_ecs=true or enable_codedeploy=false)."
 }
 output "codedeploy_group" {
-  value       = var.enable_ecs ? null : aws_codedeploy_deployment_group.dg[0].deployment_group_name
-  description = "CodeDeploy deployment group (null when enable_ecs=true)."
+  value       = var.enable_ecs || !var.enable_codedeploy ? null : aws_codedeploy_deployment_group.dg[0].deployment_group_name
+  description = "CodeDeploy deployment group (null when enable_ecs=true or enable_codedeploy=false)."
 }
 output "artifacts_bucket" {
   value       = var.enable_ecs ? null : aws_s3_bucket.artifacts[0].bucket

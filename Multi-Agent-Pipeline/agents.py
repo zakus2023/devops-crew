@@ -11,7 +11,7 @@ from tools import (
     run_full_infra_pipeline,
     docker_build,
     ecr_push_and_ssm,
-    codebuild_build_and_push,
+    ec2_docker_build_and_push,
     read_pre_built_image_tag,
     write_ssm_image_tag,
     ecr_list_image_tags,
@@ -39,8 +39,8 @@ infra_engineer = Agent(
 build_engineer = Agent(
     role="Build Engineer",
     goal="Build the Docker image for the app, push it to ECR, and update the SSM parameter image_tag so the deploy step can use the new image.",
-    backstory="You are a CI/CD build engineer. You run docker build for the app directory, then push the image to ECR. Get ECR repo name from read_ssm_ecr_repo_name(region); if ParameterNotFound, try get_terraform_output('ecr_repo', 'infra/envs/prod'). Use ecr_push_and_ssm to push and update image_tag. When Docker is unavailable (e.g. Hugging Face Space): call codebuild_build_and_push(ecr_repo_name, app_relative_path='app', region=...) to build automatically on AWS CodeBuild. If CodeBuild fails or is unavailable, fall back to read_pre_built_image_tag or ecr_list_image_tags; if a tag exists, call write_ssm_image_tag so deploy can proceed.",
-    tools=[docker_build, ecr_push_and_ssm, codebuild_build_and_push, read_pre_built_image_tag, write_ssm_image_tag, ecr_list_image_tags, read_ssm_parameter, read_ssm_ecr_repo_name, get_terraform_output],
+    backstory="You are a CI/CD build engineer. You run docker build for the app directory, then push the image to ECR. Get ECR repo name from read_ssm_ecr_repo_name(region); if ParameterNotFound, try get_terraform_output('ecr_repo', 'infra/envs/prod'). Use ecr_push_and_ssm to push and update image_tag. When Docker is unavailable (e.g. Hugging Face Space): call ec2_docker_build_and_push(ecr_repo_name, app_relative_path='app', region=...) to build automatically on the EC2 build runner. If EC2 build runner fails or is unavailable, fall back to read_pre_built_image_tag or ecr_list_image_tags; if a tag exists, call write_ssm_image_tag so deploy can proceed.",
+    tools=[docker_build, ecr_push_and_ssm, ec2_docker_build_and_push, read_pre_built_image_tag, write_ssm_image_tag, ecr_list_image_tags, read_ssm_parameter, read_ssm_ecr_repo_name, get_terraform_output],
     verbose=True,
     allow_delegation=False,
 )

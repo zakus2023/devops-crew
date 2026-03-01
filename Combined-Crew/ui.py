@@ -85,7 +85,9 @@ AWS_SECRET_ACCESS_KEY=
 # PROD_URL=
 # REQUIREMENTS_JSON=
 # ALLOW_TERRAFORM_APPLY=1
+# DEPLOY_METHOD=ssh_script
 # DEPLOY_METHOD=ansible
+# DEPLOY_METHOD=ecs
 # APP_ROOT=
 # PRE_BUILT_IMAGE_TAG=abc123  # When Docker unavailable (HF Space): tag from GitHub Actions or ecr_list_image_tags
 
@@ -445,10 +447,10 @@ def run_combined_crew(
     aws_region = (aws_region or "").strip() or "us-east-1"
     # Priority: UI input (deploy method radio) first, then DEPLOY_METHOD from .env
     deploy_method = (deploy_method or os.environ.get("DEPLOY_METHOD") or "ansible").strip().lower()
-    # Normalize invalid deploy methods (e.g. ecs_script -> ecs; shs_script -> ssh_script)
+    # Normalize invalid deploy methods (ecs_script->ecs; shs_script->ssh_script; codedeploy->ssh_script)
     if deploy_method == "ecs_script":
         deploy_method = "ecs"
-    elif deploy_method == "shs_script":
+    elif deploy_method == "shs_script" or deploy_method == "codedeploy":
         deploy_method = "ssh_script"
     elif deploy_method not in ("ansible", "ssh_script", "ecs"):
         deploy_method = "ansible"
@@ -686,10 +688,10 @@ def build_ui():
                     info="e.g. us-east-1, us-west-2",
                 )
                 _dm = (os.environ.get("DEPLOY_METHOD") or "ansible").strip().lower()
-                # Normalize invalid values (ecs_script->ecs, shs_script->ssh_script)
+                # Normalize invalid values (ecs_script->ecs; shs_script->ssh_script; codedeploy->ssh_script)
                 if _dm == "ecs_script":
                     _dm = "ecs"
-                elif _dm == "shs_script":
+                elif _dm == "shs_script" or _dm == "codedeploy":
                     _dm = "ssh_script"
                 elif _dm not in ("ansible", "ssh_script", "ecs"):
                     _dm = "ansible"

@@ -40,14 +40,9 @@ locals {
     retry $PKG_MGR makecache --setopt=skip_if_unavailable=true
     log "Installing base packages"
     retry $PKG_MGR update -y --setopt=skip_if_unavailable=true
-    retry $PKG_MGR install -y docker ruby wget amazon-cloudwatch-agent --setopt=skip_if_unavailable=true
+    retry $PKG_MGR install -y docker wget amazon-cloudwatch-agent --setopt=skip_if_unavailable=true
     systemctl enable docker
     systemctl start docker
-    cd /home/ec2-user
-    wget https://aws-codedeploy-$${REGION}.s3.$${REGION}.amazonaws.com/latest/install
-    chmod +x ./install
-    ./install auto
-    systemctl start codedeploy-agent
     /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
       -a fetch-config -m ec2 \
       -c ssm:/${var.project}/${var.env}/cloudwatch/agent-config -s

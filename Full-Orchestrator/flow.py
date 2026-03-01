@@ -35,12 +35,10 @@ Do the following in order:
 3. Generate dev environment: call the generate_dev_env tool.
 4. Generate prod environment: call the generate_prod_env tool.
 5. Generate app (Node.js + Dockerfile): call the generate_app tool.
-6. Generate deploy: call the generate_deploy tool (produces both CodeDeploy bundle deploy/ and Ansible ansible/ for deploy option codedeploy or ansible).
-7. Generate GitHub Actions workflows: call the generate_workflows tool.
-
-8. Validate: call the terraform validate tool for infra/bootstrap, then infra/envs/dev, then infra/envs/prod (the tool runs terraform init -backend=false then validate so it works right after generate). If Terraform is not installed, report that and continue.
-9. Validate: run docker build in the app directory. If Docker is not installed, report that and continue.
-10. Write the run order: call the tool_write_run_order tool with a short summary of what was generated and any notes (e.g. "Fill backend.hcl and tfvars with bootstrap outputs before running dev/prod apply").
+6. Generate deploy: call the generate_deploy tool (produces deploy/ and ansible/ for DEPLOY_METHOD ssh_script, ansible, or ecs).
+7. Validate: call the terraform validate tool for infra/bootstrap, then infra/envs/dev, then infra/envs/prod (the tool runs terraform init -backend=false then validate so it works right after generate). If Terraform is not installed, report that and continue.
+8. Validate: run docker build in the app directory. If Docker is not installed, report that and continue.
+9. Write the run order: call the tool_write_run_order tool with a short summary of what was generated and any notes (e.g. "Fill backend.hcl and tfvars with bootstrap outputs before running dev/prod apply").
 
 Summarize at the end: list what was generated, which validations passed or were skipped, and where the user should look (RUN_ORDER.md) for the exact commands to run next.""",
         expected_output="A clear summary: (1) All generated components listed, (2) Terraform and Docker validation results, (3) Pointer to RUN_ORDER.md and the recommended next steps for the user.",

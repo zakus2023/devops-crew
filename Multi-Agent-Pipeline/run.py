@@ -55,7 +55,6 @@ def _sync_deploy_method_to_terraform(repo_root: str, deploy_method: str) -> None
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read()
             if "enable_ecs" in content:
-                # Replace any existing enable_ecs = true|false with the value we need.
                 new_content = re.sub(
                     r"enable_ecs\s*=\s*(?:true|false)",
                     f"enable_ecs = {value_str}",

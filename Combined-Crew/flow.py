@@ -32,7 +32,7 @@ def create_combined_crew(
     1. Generate: full project (bootstrap, platform, dev/prod, app, deploy, workflows) into output_dir.
     2. Infra: Terraform init/plan/(apply if ALLOW_TERRAFORM_APPLY=1) in output_dir.
     3. Build: Docker build, ECR push, SSM image_tag in output_dir.
-    4. Deploy: CodeDeploy or manual steps.
+    4. Deploy: ssh_script, ansible (SSM), or ecs.
     5. Verify: Health check (if PROD_URL set) and SSM read.
     """
     # Project from requirements — SSM paths are /{project}/prod/image_tag etc. (must match Terraform)
@@ -59,10 +59,9 @@ Do in order:
 4. Generate prod environment (generate_prod_env).
 5. Generate app (generate_app).
 6. Generate deploy bundle (generate_deploy).
-7. Generate GitHub Actions workflows (generate_workflows).
-8. Run terraform validate in infra/bootstrap, infra/envs/dev, infra/envs/prod if Terraform is available.
-9. Run docker build in app if Docker is available.
-10. Write RUN_ORDER.md (tool_write_run_order).
+7. Run terraform validate in infra/bootstrap, infra/envs/dev, infra/envs/prod if Terraform is available.
+8. Run docker build in app if Docker is available.
+9. Write RUN_ORDER.md (tool_write_run_order).
 
 Summarize what was generated and any validation results.""",
         expected_output="Summary: all components generated, validation results, and pointer to RUN_ORDER.md.",
@@ -155,9 +154,9 @@ Only apply runs when ALLOW_TERRAFORM_APPLY=1; otherwise plan only. Summarize the
 2. Read ECR repo name: read_ssm_ecr_repo_name(region="{aws_region}"). If ParameterNotFound, try get_terraform_output("ecr_repo", "infra/envs/prod").
 3. ecr_push_and_ssm(ecr_repo_name, image_tag, aws_region="{aws_region}").
 
-**When Docker is unavailable** (e.g. Hugging Face Space): Use automatic CodeBuild — do NOT ask for manual steps:
-- Call codebuild_build_and_push(ecr_repo_name, app_relative_path="app", region="{aws_region}"). This zips the app, uploads to S3, runs AWS CodeBuild to build and push the image, and updates SSM image_tag.
-- If codebuild_build_and_push fails (e.g. CodeBuild project not yet applied): fall back to read_pre_built_image_tag() or ecr_list_image_tags(); if a tag exists, call write_ssm_image_tag(tag, region="{aws_region}").
+**When Docker is unavailable** (e.g. Hugging Face Space): Use automatic EC2 build runner — do NOT ask for manual steps:
+- Call ec2_docker_build_and_push(ecr_repo_name, app_relative_path="app", region="{aws_region}"). This zips the app, uploads to S3, runs SSM command on the EC2 build runner to docker build, push to ECR, and updates SSM image_tag.
+- If ec2_docker_build_and_push fails (e.g. build runner not yet applied): fall back to read_pre_built_image_tag() or ecr_list_image_tags(); if a tag exists, call write_ssm_image_tag(tag, region="{aws_region}").
 
 Summarize build and push result.""",
         expected_output="Summary: Docker build, ECR push, SSM image_tag update. Or fallback: write_ssm_image_tag when Docker unavailable.",

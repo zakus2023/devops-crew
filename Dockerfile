@@ -1,6 +1,6 @@
 # DevOps-Crew: Render deployment (full project from Git)
 # Pipeline: Generate → Infra → Build → Deploy → Verify
-# Build step: Render containers lack Docker socket — use CodeBuild or PRE_BUILT_IMAGE_TAG / ecr_list_image_tags
+# Build step: Render containers lack Docker socket — use EC2 build runner or PRE_BUILT_IMAGE_TAG / ecr_list_image_tags
 FROM python:3.11-slim
 
 # Install Terraform (required for Infra step)
@@ -18,7 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-# Skip Docker CLI on Render (no socket) — Build uses CodeBuild/ecr fallback. Saves ~50MB for free tier.
+# Skip Docker CLI on Render (no socket) — Build uses EC2 build runner/ecr fallback. Saves ~50MB for free tier.
 
 WORKDIR /app
 
