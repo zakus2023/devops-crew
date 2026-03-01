@@ -12,6 +12,7 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -374,7 +375,7 @@ def run_combined_crew(
         yield "Error: Provide a requirements.json file or paste JSON in the text box.", None
         return
     try:
-        from run import load_requirements, run_crew
+        from run import load_requirements
         req_path = getattr(requirements_file, "name", requirements_file) if requirements_file else None
         if req_path and os.path.isfile(req_path):
             requirements = load_requirements(req_path)
@@ -467,64 +468,95 @@ def run_combined_crew(
                 yield f"PEM key file not found: {p}", None
                 return
 
-    result = [None, None]  # [success, message]
-    done = threading.Event()
-    stdout_cap = _StreamCapturer(sys.stdout, "stdout")
-    stderr_cap = _StreamCapturer(sys.stderr, "stderr")
-
-    def _run():
-        old_stdout, old_stderr = sys.stdout, sys.stderr
-        sys.stdout, sys.stderr = stdout_cap, stderr_cap
+    # Run pipeline in subprocess — when it exits, OS reclaims memory (free tier 512MB)
+    job_data = {
+        "requirements": requirements,
+        "output_dir": output_dir,
+        "prod_url": prod_url,
+        "aws_region": aws_region,
+        "deploy_method": deploy_method,
+        "allow_terraform_apply": bool(allow_terraform_apply),
+        "key_name": (key_name or "").strip(),
+        "ssh_key_path": ssh_key_path,
+        "app_dir": app_dir,
+    }
+    fd, job_path = tempfile.mkstemp(suffix=".json", prefix="run_job_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(job_data, f, indent=2)
+    except Exception as e:
         try:
-            success, message = run_crew(
-                requirements=requirements,
-                output_dir=output_dir,
-                prod_url=prod_url,
-                aws_region=aws_region,
-                deploy_method=deploy_method,
-                allow_terraform_apply=bool(allow_terraform_apply),
-                key_name=(key_name or "").strip(),
-                ssh_key_path=ssh_key_path,
-                ssh_key_content=ssh_key_content,
-                app_dir=app_dir,
-            )
-            result[0], result[1] = success, message
-        except Exception as e:
-            import traceback
-            result[0], result[1] = False, f"Error: {e}\n\n{traceback.format_exc()}"
-        finally:
-            sys.stdout, sys.stderr = old_stdout, old_stderr
-            _restore_env_vars(env_prev)
-            if app_extract_dir and os.path.isdir(app_extract_dir):
-                try:
-                    shutil.rmtree(app_extract_dir, ignore_errors=True)
-                except Exception:
-                    pass
-            import gc
-            gc.collect()  # Free memory after pipeline (helps free tier 512MB)
-            done.set()
+            os.close(fd)
+        except OSError:
+            pass
+        _restore_env_vars(env_prev)
+        yield f"Failed to write job file: {e}", None
+        return
 
-    thread = threading.Thread(target=_run)
-    thread.start()
+    env = os.environ.copy()
+    if ssh_key_content:
+        env["SSH_PRIVATE_KEY"] = ssh_key_content
 
-    # Initial status
-    yield ("Starting pipeline... (live output will stream below)\n", None)
+    run_cli = os.path.join(_THIS_DIR, "run_cli.py")
+    proc = subprocess.Popen(
+        [sys.executable, run_cli, job_path],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        cwd=_THIS_DIR,
+        bufsize=1,
+    )
 
-    # Stream live output every 2s (like terminal) and keep connection alive
+    output_chunks = []
+    done = threading.Event()
+
+    def _read_stdout():
+        try:
+            if proc.stdout:
+                while True:
+                    line = proc.stdout.readline()
+                    if not line and proc.poll() is not None:
+                        break
+                    if line:
+                        output_chunks.append(line)
+        except Exception:
+            pass
+        done.set()
+
+    reader = threading.Thread(target=_read_stdout)
+    reader.start()
+
+    yield ("Starting pipeline (subprocess)... (live output will stream below)\n", None)
+
     last_len = 0
-    while not done.is_set():
+    while not done.is_set() or reader.is_alive():
         time.sleep(2)
-        out = stdout_cap.getvalue() + stderr_cap.getvalue()
+        out = "".join(output_chunks)
         if out and len(out) != last_len:
             yield (out, None)
             last_len = len(out)
+        if proc.poll() is not None and not reader.is_alive():
+            break
 
-    # Final output: console log + result (no duplicate headers)
-    out = stdout_cap.getvalue() + stderr_cap.getvalue()
-    success, message = result[0], result[1]
+    # Drain any remaining output
+    out = "".join(output_chunks)
+    exit_code = proc.returncode
+    success = exit_code == 0
     resolved_dir = os.path.abspath(output_dir) if success and output_dir else None
-    final = (out.rstrip() + "\n\n" + message) if out.strip() else message
-    yield final, resolved_dir
+    yield (out, resolved_dir)
+
+    # Cleanup
+    _restore_env_vars(env_prev)
+    try:
+        os.remove(job_path)
+    except OSError:
+        pass
+    if app_extract_dir and os.path.isdir(app_extract_dir):
+        try:
+            shutil.rmtree(app_extract_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 def run_teardown(env_file_path, env_file_upload, output_dir, output_upload, aws_region, env_vars):

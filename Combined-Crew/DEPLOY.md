@@ -123,7 +123,7 @@ If you are the sole user and prefer to set keys once, you can add them in **Envi
 - **Sleep:** Service sleeps after ~15 minutes of inactivity. The first request after sleep may take 30–60 seconds to wake.
 - **Build minutes:** Free tier has limited build minutes per month.
 - **Output:** Output is ephemeral; use **Download output** before the service sleeps or restarts.
-- **Memory:** Free tier has 512 MB RAM. The image is optimized (no Docker CLI; Build uses CodeBuild). If you hit memory limits, see [Memory limits](#memory-limits).
+- **Memory:** Free tier has 512 MB RAM. The pipeline runs in a subprocess; when it exits, the OS reclaims memory. Image omits Docker CLI (Build uses CodeBuild). See [Memory limits](#memory-limits) if needed.
 
 ---
 
